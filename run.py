@@ -69,7 +69,7 @@ def main(config: Config):
     with open(run_dir + "/args.pkl", "wb") as f:
         pickle.dump(vars(config), f)
 
-    metrics_to_collect = [
+    shared_metrics = [
         "eval/episode_dist",
         "eval/episode_reward",
         "eval/episode_reward_ctrl",
@@ -80,13 +80,38 @@ def main(config: Config):
         "eval/episode_success_any",
         "eval/episode_success_easy",
         "eval/episode_success_hard",
-        "training/actor_loss",
-        "training/log_alpha",
-        "training/alpha_loss",
-        "training/critic_loss",
-        "training/entropy",
         "training/sps",
     ]
+
+    agent_metrics = {
+        "CRL": [
+            "training/actor_loss",
+            "training/log_alpha",
+            "training/alpha_loss",
+            "training/critic_loss",
+            "training/entropy",
+        ],
+        "HIQL": [
+            "training/total_loss",
+            "training/value/loss",
+            "training/value/v_mean",
+            "training/value/v_max",
+            "training/value/v_min",
+            "training/low_actor/loss",
+            "training/low_actor/adv",
+            "training/low_actor/bc_log_prob",
+            "training/low_actor/mse",
+            "training/low_actor/std",
+            "training/high_actor/loss",
+            "training/high_actor/adv",
+            "training/high_actor/bc_log_prob",
+            "training/high_actor/mse",
+            "training/high_actor/std",
+        ],
+    }
+
+    agent_name = type(config.agent).__name__
+    metrics_to_collect = shared_metrics + agent_metrics.get(agent_name, [])
 
     metrics_recorder = MetricsRecorder(
         config.run.total_env_steps,
