@@ -108,6 +108,24 @@ def main(config: Config):
             "training/high_actor/mse",
             "training/high_actor/std",
         ],
+        "HSAC": [
+            "training/total_loss",
+            "training/critic/loss",
+            "training/critic/q_mean",
+            "training/critic/q_min",
+            "training/critic/q_max",
+            "training/critic/target_q_mean",
+            "training/low_actor/loss",
+            "training/low_actor/entropy",
+            "training/low_actor/q_pi",
+            "training/low_actor/std",
+            "training/high_actor/loss",
+            "training/high_actor/entropy",
+            "training/high_actor/q_pi",
+            "training/high_actor/std",
+            "training/alpha/low",
+            "training/alpha/high",
+        ],
     }
 
     agent_name = type(config.agent).__name__
