@@ -14,28 +14,18 @@
 
 """SAC networks."""
 
-from typing import Any, Callable, Sequence, Tuple
+from typing import Any, Callable, Optional, Sequence, Tuple
 
 import flax
 import jax
 import jax.numpy as jnp
+import optax
 from brax.training import distribution, networks, types
 from brax.training.types import PRNGKey
 from flax import linen
 
 ActivationFn = Callable[[jnp.ndarray], jnp.ndarray]
 Initializer = Callable[..., Any]
-
-
-ActivationFn = Callable[[jnp.ndarray], jnp.ndarray]
-Initializer = Callable[..., Any]
-
-
-@flax.struct.dataclass
-class SACNetworks:
-    policy_network: networks.FeedForwardNetwork
-    q_network: networks.FeedForwardNetwork
-    parametric_action_distribution: distribution.ParametricDistribution
 
 
 class MLP(linen.Module):
@@ -63,6 +53,53 @@ class MLP(linen.Module):
                     hidden = linen.LayerNorm()(hidden)
                 hidden = self.activation(hidden)
         return hidden
+
+
+class GoalRep(linen.Module):
+    """Subgoal representation phi([s; g]). L2-normalized to radius sqrt(rep_dim)."""
+
+    layer_sizes: Sequence[int] = (256, 256)
+    rep_dim: int = 10
+    layer_norm: bool = True
+
+    @linen.compact
+    def __call__(self, observations: jnp.ndarray, goals: jnp.ndarray):
+        x = jnp.concatenate([observations, goals], axis=-1)
+        x = MLP(
+            layer_sizes=list(self.layer_sizes) + [self.rep_dim],
+            activate_final=False,
+            layer_norm=self.layer_norm,
+        )(x)
+        x = x / optax.safe_norm(x, min_norm=1e-8, ord=2, axis=-1, keepdims=True) * jnp.sqrt(
+            x.shape[-1]
+        )
+        return x
+
+
+class ActionsEncoder(linen.Module):
+    """MLP encoder for flattened action sequences -> rep_dim (for InfoNCE keys)."""
+
+    layer_sizes: Sequence[int] = (256, 256)
+    rep_dim: int = 10
+    layer_norm: bool = True
+
+    @linen.compact
+    def __call__(self, actions_flat: jnp.ndarray):
+        x = MLP(
+            layer_sizes=list(self.layer_sizes) + [self.rep_dim],
+            activate_final=False,
+            layer_norm=self.layer_norm,
+        )(actions_flat)
+        return x
+
+
+@flax.struct.dataclass
+class SACNetworks:
+    policy_network: networks.FeedForwardNetwork
+    q_network: networks.FeedForwardNetwork
+    parametric_action_distribution: distribution.ParametricDistribution
+    goal_rep_network: Optional[GoalRep] = None
+    actions_encoder_network: Optional[ActionsEncoder] = None
 
 
 def make_q_network(
@@ -149,6 +186,36 @@ def make_inference_fn(sac_networks: SACNetworks):
     return make_policy
 
 
+def make_goal_rep_inference_fn(sac_networks: SACNetworks, state_dim: int, goal_dim: int):
+    """Creates inference function that applies goal_rep before the policy.
+
+    Params tuple: (normalizer_params, policy_params, goal_rep_params).
+    The policy network was created with identity preprocessing so normalizer_params
+    is only used structurally (identity fn ignores it).
+    """
+    goal_rep_network = sac_networks.goal_rep_network
+
+    def make_policy(params: types.PolicyParams, deterministic: bool = False) -> types.Policy:
+        normalizer_params, policy_params, goal_rep_params = params
+
+        def policy(observations: types.Observation, key_sample: PRNGKey) -> Tuple[types.Action, types.Extra]:
+            state = observations[..., :state_dim]
+            goal = observations[..., state_dim : state_dim + goal_dim]
+            phi = goal_rep_network.apply(goal_rep_params, state, goal)
+            actor_input = jnp.concatenate([state, phi], axis=-1)
+            logits = sac_networks.policy_network.apply(normalizer_params, policy_params, actor_input)
+            if deterministic:
+                return sac_networks.parametric_action_distribution.mode(logits), {}
+            return (
+                sac_networks.parametric_action_distribution.sample(logits, key_sample),
+                {},
+            )
+
+        return policy
+
+    return make_policy
+
+
 def make_sac_networks(
     observation_size: int,
     action_size: int,
@@ -179,4 +246,57 @@ def make_sac_networks(
         policy_network=policy_network,
         q_network=q_network,
         parametric_action_distribution=parametric_action_distribution,
+    )
+
+
+def make_sac_networks_with_goal_rep(
+    state_dim: int,
+    goal_dim: int,
+    action_size: int,
+    rep_dim: int = 10,
+    goal_rep_hidden: Sequence[int] = (256, 256),
+    use_info_nce: bool = False,
+    preprocess_observations_fn: types.PreprocessObservationFn = types.identity_observation_preprocessor,
+    hidden_layer_sizes: Sequence[int] = (256, 256),
+    activation: networks.ActivationFn = linen.relu,
+    layer_norm: bool = False,
+) -> SACNetworks:
+    """Make SAC networks with goal_rep as actor input. Critic uses full obs."""
+    obs_size = state_dim + goal_dim
+    parametric_action_distribution = distribution.NormalTanhDistribution(event_size=action_size)
+    actor_obs_size = state_dim + rep_dim
+    policy_network = make_policy_network(
+        parametric_action_distribution.param_size,
+        actor_obs_size,
+        preprocess_observations_fn=types.identity_observation_preprocessor,
+        hidden_layer_sizes=hidden_layer_sizes,
+        activation=activation,
+        layer_norm=layer_norm,
+    )
+    q_network = make_q_network(
+        obs_size,
+        action_size,
+        preprocess_observations_fn=preprocess_observations_fn,
+        hidden_layer_sizes=hidden_layer_sizes,
+        activation=activation,
+        layer_norm=layer_norm,
+    )
+    goal_rep_network = GoalRep(
+        layer_sizes=list(goal_rep_hidden),
+        rep_dim=rep_dim,
+        layer_norm=layer_norm,
+    )
+    actions_encoder_network = None
+    if use_info_nce:
+        actions_encoder_network = ActionsEncoder(
+            layer_sizes=list(goal_rep_hidden),
+            rep_dim=rep_dim,
+            layer_norm=layer_norm,
+        )
+    return SACNetworks(
+        policy_network=policy_network,
+        q_network=q_network,
+        parametric_action_distribution=parametric_action_distribution,
+        goal_rep_network=goal_rep_network,
+        actions_encoder_network=actions_encoder_network,
     )

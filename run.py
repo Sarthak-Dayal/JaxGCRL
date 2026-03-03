@@ -84,6 +84,13 @@ def main(config: Config):
     ]
 
     agent_metrics = {
+        "SAC": [
+            "training/actor_loss",
+            "training/critic_loss",
+            "training/alpha_loss",
+            "training/alpha",
+            "training/nce_loss",
+        ],
         "CRL": [
             "training/actor_loss",
             "training/log_alpha",

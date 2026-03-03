@@ -86,6 +86,155 @@ ReplayBufferState = Any
 _PMAP_AXIS_NAME = "i"
 
 
+# ---------------------------------------------------------------------------
+# InfoNCE loss (ported from OGBench)
+# ---------------------------------------------------------------------------
+
+def _info_nce_loss(queries, keys, temperature=0.1):
+    """Symmetric InfoNCE loss. queries and keys are (batch, rep_dim).
+
+    Both are L2-normalized before computing similarity.
+    Uses optax.safe_norm to avoid NaN gradients when norm approaches zero.
+    """
+    q_norm = optax.safe_norm(queries, min_norm=1e-6, ord=2, axis=-1, keepdims=True)
+    k_norm = optax.safe_norm(keys, min_norm=1e-6, ord=2, axis=-1, keepdims=True)
+    queries = queries / q_norm
+    keys = keys / k_norm
+    sim = jnp.matmul(queries, keys.T) / temperature
+    diag = jnp.diag(sim)
+    loss_fwd = jnp.mean(-diag + jax.nn.logsumexp(sim, axis=-1))
+    loss_rev = jnp.mean(-diag + jax.nn.logsumexp(sim, axis=0))
+    return loss_fwd + loss_rev
+
+
+# ---------------------------------------------------------------------------
+# Custom losses for goal_rep actor path
+# ---------------------------------------------------------------------------
+
+def _make_losses_with_goal_rep(
+    sac_network: networks.SACNetworks,
+    reward_scaling: float,
+    discounting: float,
+    action_size: int,
+    state_dim: int,
+    goal_dim: int,
+    use_info_nce: bool,
+    nce_temperature: float,
+    infonce_weight: float,
+):
+    """Creates SAC losses where the actor uses goal_rep(state, goal) as input.
+
+    The loss function signatures match brax's gradient_update_fn convention
+    (first arg is the params to differentiate).
+
+    For alpha and critic, the second arg is ``actor_params`` (a dict with
+    keys "policy", "goal_rep", and optionally "actions_encoder") passed as
+    non-differentiable context.
+    For actor, the first arg IS actor_params (differentiated).
+    """
+    target_entropy = -0.5 * action_size
+    policy_network = sac_network.policy_network
+    q_network = sac_network.q_network
+    parametric_action_distribution = sac_network.parametric_action_distribution
+    goal_rep_network = sac_network.goal_rep_network
+    actions_encoder_network = sac_network.actions_encoder_network
+
+    def _goal_rep_actor_input(goal_rep_params, obs):
+        state = obs[..., :state_dim]
+        goal = obs[..., state_dim : state_dim + goal_dim]
+        phi = goal_rep_network.apply(goal_rep_params, state, goal)
+        return jnp.concatenate([state, phi], axis=-1)
+
+    def alpha_loss(
+        log_alpha: jnp.ndarray,
+        actor_params,
+        normalizer_params,
+        transitions,
+        key: PRNGKey,
+    ):
+        goal_rep_params = jax.lax.stop_gradient(actor_params["goal_rep"])
+        policy_params = jax.lax.stop_gradient(actor_params["policy"])
+        actor_input = _goal_rep_actor_input(goal_rep_params, transitions.observation)
+        dist_params = policy_network.apply(normalizer_params, policy_params, actor_input)
+        action = parametric_action_distribution.sample_no_postprocessing(dist_params, key)
+        log_prob = parametric_action_distribution.log_prob(dist_params, action)
+        alpha = jnp.exp(log_alpha)
+        return jnp.mean(alpha * jax.lax.stop_gradient(-log_prob - target_entropy))
+
+    def critic_loss(
+        q_params,
+        actor_params,
+        normalizer_params,
+        target_q_params,
+        alpha,
+        transitions,
+        key: PRNGKey,
+    ):
+        sg = jax.lax.stop_gradient
+        goal_rep_params = sg(actor_params["goal_rep"])
+        policy_params = sg(actor_params["policy"])
+
+        q_old_action = q_network.apply(
+            normalizer_params, q_params, transitions.observation, transitions.action
+        )
+        next_actor_input = _goal_rep_actor_input(goal_rep_params, transitions.next_observation)
+        next_dist_params = policy_network.apply(normalizer_params, policy_params, next_actor_input)
+        next_action = parametric_action_distribution.sample_no_postprocessing(next_dist_params, key)
+        next_log_prob = parametric_action_distribution.log_prob(next_dist_params, next_action)
+        next_action = parametric_action_distribution.postprocess(next_action)
+        next_q = q_network.apply(
+            normalizer_params, target_q_params, transitions.next_observation, next_action
+        )
+        next_v = jnp.min(next_q, axis=-1) - alpha * next_log_prob
+        target_q = jax.lax.stop_gradient(
+            transitions.reward * reward_scaling + transitions.discount * discounting * next_v
+        )
+        q_error = q_old_action - jnp.expand_dims(target_q, -1)
+        truncation = transitions.extras["state_extras"]["truncation"]
+        q_error *= jnp.expand_dims(1 - truncation, -1)
+        return 0.5 * jnp.mean(jnp.square(q_error))
+
+    def actor_loss(
+        actor_params,
+        normalizer_params,
+        q_params,
+        alpha,
+        transitions,
+        key: PRNGKey,
+    ):
+        goal_rep_params = actor_params["goal_rep"]
+        policy_params = actor_params["policy"]
+
+        actor_input = _goal_rep_actor_input(goal_rep_params, transitions.observation)
+        dist_params = policy_network.apply(normalizer_params, policy_params, actor_input)
+        action = parametric_action_distribution.sample_no_postprocessing(dist_params, key)
+        log_prob = parametric_action_distribution.log_prob(dist_params, action)
+        action = parametric_action_distribution.postprocess(action)
+        q_action = q_network.apply(
+            normalizer_params, q_params, transitions.observation, action
+        )
+        min_q = jnp.min(q_action, axis=-1)
+        sac_loss = jnp.mean(alpha * log_prob - min_q)
+
+        total_loss = sac_loss
+        if use_info_nce:
+            actions_encoder_params = actor_params["actions_encoder"]
+            infonce = transitions.extras["infonce"]
+            queries = goal_rep_network.apply(
+                goal_rep_params, infonce["state_t"], infonce["goal_tk"]
+            )
+            keys = actions_encoder_network.apply(actions_encoder_params, infonce["actions_list"])
+            nce_loss = _info_nce_loss(queries, keys, nce_temperature)
+            total_loss = total_loss + infonce_weight * nce_loss
+        return total_loss
+
+    return alpha_loss, critic_loss, actor_loss
+
+
+# ---------------------------------------------------------------------------
+# Flatten batch (HER + optional InfoNCE data)
+# ---------------------------------------------------------------------------
+
 @functools.partial(jax.jit, static_argnames=["config", "env"])
 def flatten_batch(config, env, transition: Transition, sample_key: PRNGKey) -> Transition:
     if config.use_her:
@@ -130,6 +279,41 @@ def flatten_batch(config, env, transition: Transition, sample_key: PRNGKey) -> T
         next_state = transition.next_observation[:, : env.state_dim]
         new_next_obs = jnp.concatenate([next_state, new_goals], axis=1)
 
+        if config.use_info_nce:
+            state_dim = env.state_dim
+            action_dim = transition.action.shape[-1]
+            nce_k = config.nce_k_step
+            final_idx = new_goals_idx
+
+            t_k_idx = jnp.minimum(arrangement + nce_k, final_idx)
+
+            state_t = state  # (seq_len, state_dim)
+            goal_tk = transition.observation[t_k_idx][:, env.goal_indices]  # (seq_len, goal_dim)
+
+            action_indices = jnp.minimum(
+                arrangement[:, None] + jnp.arange(nce_k), final_idx[:, None]
+            )
+            valid = (arrangement[:, None] + jnp.arange(nce_k)) <= final_idx[:, None]
+            actions_at_k = transition.action[action_indices]
+            actions_list = jnp.where(
+                valid[:, :, None], actions_at_k, 0.0
+            ).reshape(seq_len, nce_k * action_dim)
+
+            new_extras = {
+                **transition.extras,
+                "infonce": {
+                    "state_t": state_t,
+                    "goal_tk": goal_tk,
+                    "actions_list": actions_list,
+                },
+            }
+            return transition._replace(
+                observation=jnp.squeeze(new_obs),
+                next_observation=jnp.squeeze(new_next_obs),
+                reward=jnp.squeeze(new_reward),
+                extras=new_extras,
+            )
+
         return transition._replace(
             observation=jnp.squeeze(new_obs),
             next_observation=jnp.squeeze(new_next_obs),
@@ -138,6 +322,10 @@ def flatten_batch(config, env, transition: Transition, sample_key: PRNGKey) -> T
 
     return transition
 
+
+# ---------------------------------------------------------------------------
+# Training state
+# ---------------------------------------------------------------------------
 
 @dataclass
 class TrainingState:
@@ -153,6 +341,8 @@ class TrainingState:
     alpha_optimizer_state: optax.OptState
     alpha_params: Params
     normalizer_params: running_statistics.RunningStatisticsState
+    goal_rep_params: Optional[Params] = None
+    actions_encoder_params: Optional[Params] = None
 
 
 def _unpmap(v):
@@ -167,16 +357,39 @@ def _init_training_state(
     alpha_optimizer: optax.GradientTransformation,
     policy_optimizer: optax.GradientTransformation,
     q_optimizer: optax.GradientTransformation,
+    state_dim: int = 0,
+    goal_dim: int = 0,
+    action_size: int = 0,
+    nce_k_step: int = 0,
+    use_info_nce: bool = False,
 ) -> TrainingState:
     """Inits the training state and replicates it over devices."""
-    key_policy, key_q = jax.random.split(key)
+    key_policy, key_q, key_gr, key_ae = jax.random.split(key, 4)
     log_alpha = jnp.asarray(0.0, dtype=jnp.float32)
     alpha_optimizer_state = alpha_optimizer.init(log_alpha)
 
     policy_params = sac_network.policy_network.init(key_policy)
-    policy_optimizer_state = policy_optimizer.init(policy_params)
     q_params = sac_network.q_network.init(key_q)
     q_optimizer_state = q_optimizer.init(q_params)
+
+    goal_rep_params = None
+    actions_encoder_params = None
+
+    use_goal_rep = sac_network.goal_rep_network is not None
+    if use_goal_rep:
+        dummy_state = jnp.zeros((1, state_dim))
+        dummy_goal = jnp.zeros((1, goal_dim))
+        goal_rep_params = sac_network.goal_rep_network.init(key_gr, dummy_state, dummy_goal)
+
+        actor_params = {"policy": policy_params, "goal_rep": goal_rep_params}
+        if use_info_nce and sac_network.actions_encoder_network is not None:
+            dummy_actions_flat = jnp.zeros((1, nce_k_step * action_size))
+            actions_encoder_params = sac_network.actions_encoder_network.init(key_ae, dummy_actions_flat)
+            actor_params["actions_encoder"] = actions_encoder_params
+
+        policy_optimizer_state = policy_optimizer.init(actor_params)
+    else:
+        policy_optimizer_state = policy_optimizer.init(policy_params)
 
     normalizer_params = running_statistics.init_state(specs.Array((obs_size,), jnp.dtype("float32")))
 
@@ -191,9 +404,15 @@ def _init_training_state(
         alpha_optimizer_state=alpha_optimizer_state,
         alpha_params=log_alpha,
         normalizer_params=normalizer_params,
+        goal_rep_params=goal_rep_params,
+        actions_encoder_params=actions_encoder_params,
     )
     return jax.device_put_replicated(training_state, jax.local_devices()[:local_devices_to_use])
 
+
+# ---------------------------------------------------------------------------
+# SAC agent
+# ---------------------------------------------------------------------------
 
 @dataclass
 class SAC:
@@ -204,7 +423,6 @@ class SAC:
     batch_size: int = 256
     normalize_observations: bool = False
     reward_scaling: float = 1.0
-    # target update rate
     tau: float = 0.005
     min_replay_size: int = 0
     max_replay_size: Optional[int] = 10000
@@ -213,10 +431,16 @@ class SAC:
     unroll_length: int = 50
     h_dim: int = 256
     n_hidden: int = 2
-    # layer norm
     use_ln: bool = False
-    # hindsight experience replay
     use_her: bool = False
+    # goal_rep as actor input (requires use_her)
+    use_goal_rep_actor: bool = False
+    use_info_nce: bool = False
+    rep_dim: int = 10
+    goal_rep_hidden: Tuple[int, ...] = (256, 256)
+    nce_k_step: int = 25
+    nce_temperature: float = 0.1
+    infonce_weight: float = 0.5
 
     def train_fn(
         self,
@@ -238,7 +462,11 @@ class SAC:
             local_devices_to_use,
             device_count,
         )
-        network_factory: types.NetworkFactory[networks.SACNetworks] = networks.make_sac_networks
+
+        if self.use_goal_rep_actor and not self.use_her:
+            raise ValueError("use_goal_rep_actor requires use_her=True")
+        if self.use_info_nce and not self.use_goal_rep_actor:
+            raise ValueError("use_info_nce requires use_goal_rep_actor=True")
 
         if self.min_replay_size >= config.total_env_steps:
             raise ValueError("No training will happen because min_replay_size >= total_env_steps")
@@ -248,17 +476,12 @@ class SAC:
         else:
             max_replay_size = self.max_replay_size
 
-        # The number of environment steps executed for every `actor_step()` call.
         env_steps_per_actor_step = config.action_repeat * config.num_envs * self.unroll_length
         num_prefill_actor_steps = self.min_replay_size // self.unroll_length + 1
         logging.info("Num_prefill_actor_steps: %s", num_prefill_actor_steps)
         num_prefill_env_steps = num_prefill_actor_steps * env_steps_per_actor_step
         assert config.total_env_steps - self.min_replay_size >= 0
         num_evals_after_init = max(config.num_evals - 1, 1)
-        # The number of epoch calls per training
-        # equals to
-        # ceil(config.total_env_steps - num_prefill_env_steps /
-        #      (num_evals_after_init * env_steps_per_actor_step))
         num_training_steps_per_epoch = -(
             -(config.total_env_steps - num_prefill_env_steps)
             // (num_evals_after_init * env_steps_per_actor_step)
@@ -290,26 +513,47 @@ class SAC:
 
         obs_size = env.observation_size
         action_size = env.action_size
+        state_dim = getattr(env, "state_dim", obs_size)
+        goal_dim = len(getattr(env, "goal_indices", []))
+        if self.use_goal_rep_actor and goal_dim == 0:
+            raise ValueError("use_goal_rep_actor requires env with goal_indices")
 
         def normalize_fn(x, y):
             return x
 
         if self.normalize_observations:
             normalize_fn = running_statistics.normalize
-        sac_network = network_factory(
-            observation_size=obs_size,
-            action_size=action_size,
-            preprocess_observations_fn=normalize_fn,
-            layer_norm=self.use_ln,
-            hidden_layer_sizes=[self.h_dim] * self.n_hidden,
-        )
-        make_policy = networks.make_inference_fn(sac_network)
 
+        # ---- Build networks ----
+        if self.use_goal_rep_actor:
+            sac_network = networks.make_sac_networks_with_goal_rep(
+                state_dim=state_dim,
+                goal_dim=goal_dim,
+                action_size=action_size,
+                rep_dim=self.rep_dim,
+                goal_rep_hidden=self.goal_rep_hidden,
+                use_info_nce=self.use_info_nce,
+                preprocess_observations_fn=normalize_fn,
+                hidden_layer_sizes=[self.h_dim] * self.n_hidden,
+                layer_norm=self.use_ln,
+            )
+            make_policy = networks.make_goal_rep_inference_fn(sac_network, state_dim, goal_dim)
+        else:
+            sac_network = networks.make_sac_networks(
+                observation_size=obs_size,
+                action_size=action_size,
+                preprocess_observations_fn=normalize_fn,
+                layer_norm=self.use_ln,
+                hidden_layer_sizes=[self.h_dim] * self.n_hidden,
+            )
+            make_policy = networks.make_inference_fn(sac_network)
+
+        # ---- Optimizers ----
         alpha_optimizer = optax.adam(learning_rate=3e-4)
-
         policy_optimizer = optax.adam(learning_rate=self.learning_rate)
         q_optimizer = optax.adam(learning_rate=self.learning_rate)
 
+        # ---- Replay buffer ----
         dummy_obs = jnp.zeros((obs_size,))
         dummy_action = jnp.zeros((action_size,))
         dummy_transition = Transition(  # pytype: disable=wrong-arg-types  # jax-ndarray
@@ -336,41 +580,71 @@ class SAC:
             )
         )
 
-        alpha_loss, critic_loss, actor_loss = sac_losses.make_losses(
-            sac_network=sac_network,
-            reward_scaling=self.reward_scaling,
-            discounting=self.discounting,
-            action_size=action_size,
-        )
-        alpha_update = gradients.gradient_update_fn(  # pytype: disable=wrong-arg-types  # jax-ndarray
+        # ---- Losses and gradient updates ----
+        if self.use_goal_rep_actor:
+            alpha_loss, critic_loss, actor_loss = _make_losses_with_goal_rep(
+                sac_network=sac_network,
+                reward_scaling=self.reward_scaling,
+                discounting=self.discounting,
+                action_size=action_size,
+                state_dim=state_dim,
+                goal_dim=goal_dim,
+                use_info_nce=self.use_info_nce,
+                nce_temperature=self.nce_temperature,
+                infonce_weight=self.infonce_weight,
+            )
+        else:
+            alpha_loss, critic_loss, actor_loss = sac_losses.make_losses(
+                sac_network=sac_network,
+                reward_scaling=self.reward_scaling,
+                discounting=self.discounting,
+                action_size=action_size,
+            )
+
+        alpha_update = gradients.gradient_update_fn(
             alpha_loss, alpha_optimizer, pmap_axis_name=_PMAP_AXIS_NAME
         )
-        critic_update = gradients.gradient_update_fn(  # pytype: disable=wrong-arg-types  # jax-ndarray
+        critic_update = gradients.gradient_update_fn(
             critic_loss, q_optimizer, pmap_axis_name=_PMAP_AXIS_NAME
         )
-        actor_update = gradients.gradient_update_fn(  # pytype: disable=wrong-arg-types  # jax-ndarray
+        actor_update = gradients.gradient_update_fn(
             actor_loss, policy_optimizer, pmap_axis_name=_PMAP_AXIS_NAME
         )
 
+        # ---- Helper to pack/unpack actor params for goal_rep path ----
+        _use_goal_rep = self.use_goal_rep_actor
+        _use_nce = self.use_info_nce
+
+        def _pack_actor_params(ts: TrainingState):
+            if _use_goal_rep:
+                d = {"policy": ts.policy_params, "goal_rep": ts.goal_rep_params}
+                if _use_nce:
+                    d["actions_encoder"] = ts.actions_encoder_params
+                return d
+            return ts.policy_params
+
+        # ---- Update step ----
         def update_step(
             carry: Tuple[TrainingState, PRNGKey], transitions: Transition
         ) -> Tuple[Tuple[TrainingState, PRNGKey], Metrics]:
             training_state, key = carry
-
             key, key_alpha, key_critic, key_actor = jax.random.split(key, 4)
 
-            alpha_loss, alpha_params, alpha_optimizer_state = alpha_update(
+            actor_params = _pack_actor_params(training_state)
+
+            alpha_loss_val, alpha_params, alpha_optimizer_state = alpha_update(
                 training_state.alpha_params,
-                training_state.policy_params,
+                actor_params,
                 training_state.normalizer_params,
                 transitions,
                 key_alpha,
                 optimizer_state=training_state.alpha_optimizer_state,
             )
             alpha = jnp.exp(training_state.alpha_params)
-            critic_loss, q_params, q_optimizer_state = critic_update(
+
+            critic_loss_val, q_params, q_optimizer_state = critic_update(
                 training_state.q_params,
-                training_state.policy_params,
+                actor_params,
                 training_state.normalizer_params,
                 training_state.target_q_params,
                 alpha,
@@ -378,8 +652,9 @@ class SAC:
                 key_critic,
                 optimizer_state=training_state.q_optimizer_state,
             )
-            actor_loss, policy_params, policy_optimizer_state = actor_update(
-                training_state.policy_params,
+
+            actor_loss_val, new_actor_params, policy_optimizer_state = actor_update(
+                actor_params,
                 training_state.normalizer_params,
                 training_state.q_params,
                 alpha,
@@ -388,6 +663,19 @@ class SAC:
                 optimizer_state=training_state.policy_optimizer_state,
             )
 
+            # Unpack updated actor params
+            if _use_goal_rep:
+                new_policy_params = new_actor_params["policy"]
+                new_goal_rep_params = new_actor_params["goal_rep"]
+                if _use_nce:
+                    new_actions_encoder_params = new_actor_params["actions_encoder"]
+                else:
+                    new_actions_encoder_params = training_state.actions_encoder_params
+            else:
+                new_policy_params = new_actor_params
+                new_goal_rep_params = training_state.goal_rep_params
+                new_actions_encoder_params = training_state.actions_encoder_params
+
             new_target_q_params = jax.tree_util.tree_map(
                 lambda x, y: x * (1 - self.tau) + y * self.tau,
                 training_state.target_q_params,
@@ -395,15 +683,26 @@ class SAC:
             )
 
             metrics = {
-                "critic_loss": critic_loss,
-                "actor_loss": actor_loss,
-                "alpha_loss": alpha_loss,
+                "critic_loss": critic_loss_val,
+                "actor_loss": actor_loss_val,
+                "alpha_loss": alpha_loss_val,
                 "alpha": jnp.exp(alpha_params),
             }
+            if _use_nce:
+                infonce = transitions.extras["infonce"]
+                queries = sac_network.goal_rep_network.apply(
+                    new_goal_rep_params, infonce["state_t"], infonce["goal_tk"]
+                )
+                keys = sac_network.actions_encoder_network.apply(
+                    new_actions_encoder_params, infonce["actions_list"]
+                )
+                metrics["nce_loss"] = _info_nce_loss(
+                    queries, keys, self.nce_temperature
+                )
 
             new_training_state = TrainingState(
                 policy_optimizer_state=policy_optimizer_state,
-                policy_params=policy_params,
+                policy_params=new_policy_params,
                 q_optimizer_state=q_optimizer_state,
                 q_params=q_params,
                 target_q_params=new_target_q_params,
@@ -412,21 +711,26 @@ class SAC:
                 alpha_optimizer_state=alpha_optimizer_state,
                 alpha_params=alpha_params,
                 normalizer_params=training_state.normalizer_params,
+                goal_rep_params=new_goal_rep_params,
+                actions_encoder_params=new_actions_encoder_params,
             )
             return (new_training_state, key), metrics
 
+        # ---- Helper to extract policy params for inference ----
+        def _get_policy_inference_params(ts: TrainingState):
+            if _use_goal_rep:
+                return (ts.normalizer_params, ts.policy_params, ts.goal_rep_params)
+            return (ts.normalizer_params, ts.policy_params)
+
+        # ---- Experience collection ----
         def get_experience(
             normalizer_params: running_statistics.RunningStatisticsState,
-            policy_params: Params,
+            policy_params,
             env_state: Union[envs.State, envs_v1.State],
             buffer_state: ReplayBufferState,
             key: PRNGKey,
-        ) -> Tuple[
-            running_statistics.RunningStatisticsState,
-            Union[envs.State, envs_v1.State],
-            ReplayBufferState,
-        ]:
-            policy = make_policy((normalizer_params, policy_params))
+        ):
+            policy = make_policy(policy_params)
 
             @jax.jit
             def f(carry, unused_t):
@@ -437,10 +741,7 @@ class SAC:
                     env_state,
                     policy,
                     current_key,
-                    extra_fields=(
-                        "truncation",
-                        "traj_id",
-                    ),
+                    extra_fields=("truncation", "traj_id"),
                 )
                 return (env_state, next_key), transition
 
@@ -450,7 +751,7 @@ class SAC:
                 normalizer_params,
                 jax.tree_util.tree_map(
                     lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), data
-                ).observation,  # so that batch_size*unroll_length is the first dimension
+                ).observation,
                 pmap_axis_name=_PMAP_AXIS_NAME,
             )
             buffer_state = replay_buffer.insert(buffer_state, data)
@@ -463,9 +764,10 @@ class SAC:
             key: PRNGKey,
         ) -> Tuple[TrainingState, Union[envs.State, envs_v1.State], ReplayBufferState, Metrics]:
             experience_key, training_key = jax.random.split(key)
+            policy_inf_params = _get_policy_inference_params(training_state)
             normalizer_params, env_state, buffer_state = get_experience(
                 training_state.normalizer_params,
-                training_state.policy_params,
+                policy_inf_params,
                 env_state,
                 buffer_state,
                 experience_key,
@@ -488,9 +790,10 @@ class SAC:
                 del unused
                 training_state, env_state, buffer_state, key = carry
                 key, new_key = jax.random.split(key)
+                policy_inf_params = _get_policy_inference_params(training_state)
                 new_normalizer_params, env_state, buffer_state = get_experience(
                     training_state.normalizer_params,
-                    training_state.policy_params,
+                    policy_inf_params,
                     env_state,
                     buffer_state,
                     key,
@@ -523,7 +826,6 @@ class SAC:
                 self, env, transitions, batch_keys
             )
 
-            # Shuffle transitions and reshape them into (num_update_steps, batch_size, ...)
             transitions = jax.tree_util.tree_map(
                 lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"),
                 transitions,
@@ -574,7 +876,6 @@ class SAC:
 
         training_epoch = jax.pmap(training_epoch, axis_name=_PMAP_AXIS_NAME)
 
-        # Note that this is NOT a pure jittable method.
         def training_epoch_with_timing(
             training_state: TrainingState,
             env_state: envs.State,
@@ -616,6 +917,11 @@ class SAC:
             alpha_optimizer=alpha_optimizer,
             policy_optimizer=policy_optimizer,
             q_optimizer=q_optimizer,
+            state_dim=state_dim,
+            goal_dim=goal_dim,
+            action_size=action_size,
+            nce_k_step=self.nce_k_step,
+            use_info_nce=self.use_info_nce,
         )
         del global_key
 
@@ -656,14 +962,14 @@ class SAC:
         metrics = {}
         if process_id == 0 and config.num_evals > 1:
             metrics = evaluator.run_evaluation(
-                _unpmap((training_state.normalizer_params, training_state.policy_params)),
+                _unpmap(_get_policy_inference_params(training_state)),
                 training_metrics={},
             )
             progress_fn(
                 0,
                 metrics,
                 make_policy,
-                _unpmap((training_state.normalizer_params, training_state.policy_params)),
+                _unpmap(_get_policy_inference_params(training_state)),
                 unwrapped_env,
             )
 
@@ -695,14 +1001,12 @@ class SAC:
             # Eval and logging
             if process_id == 0:
                 if config.checkpoint_logdir:
-                    # Save current policy.
-                    params = _unpmap((training_state.normalizer_params, training_state.policy_params))
+                    params = _unpmap(_get_policy_inference_params(training_state))
                     path = f"{config.checkpoint_logdir}_sac_{current_step}.pkl"
                     model.save_params(path, params)
 
-                # Run evals.
                 metrics = evaluator.run_evaluation(
-                    _unpmap((training_state.normalizer_params, training_state.policy_params)),
+                    _unpmap(_get_policy_inference_params(training_state)),
                     training_metrics,
                 )
                 do_render = (eval_epoch_num % config.visualization_interval) == 0
@@ -710,7 +1014,7 @@ class SAC:
                     current_step,
                     metrics,
                     make_policy,
-                    _unpmap((training_state.normalizer_params, training_state.policy_params)),
+                    _unpmap(_get_policy_inference_params(training_state)),
                     unwrapped_env,
                     do_render,
                 )
@@ -718,10 +1022,8 @@ class SAC:
         total_steps = current_step
         assert total_steps >= config.total_env_steps
 
-        params = _unpmap((training_state.normalizer_params, training_state.policy_params))
+        params = _unpmap(_get_policy_inference_params(training_state))
 
-        # If there was no mistakes the training_state should still be identical on all
-        # devices.
         pmap.assert_is_replicated(training_state)
         logging.info("total steps: %s", total_steps)
         pmap.synchronize_hosts()
