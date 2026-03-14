@@ -23,6 +23,10 @@ dependencies = [
   "tyro>=0.9.16",
   "wandb",
   "wandb-osh",
+  "distrax>=0.1.5",
+  "uv>=0.10.10",
+  "nvidia-cufft-cu12>=11.4.1.4",
+  "nvidia-cuda-runtime-cu12>=12.9.79",
 ]
 
 [project.scripts]
