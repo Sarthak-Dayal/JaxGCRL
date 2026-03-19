@@ -34,7 +34,6 @@ from brax.training.acme import running_statistics, specs
 from brax.training.agents.ppo import losses as ppo_losses
 from brax.training.agents.ppo import networks as ppo_networks
 from brax.training.types import Params, PRNGKey
-from brax.v1 import envs as envs_v1
 from etils import epath
 from orbax import checkpoint as ocp
 
@@ -120,8 +119,8 @@ class PPO:
     def train_fn(
         self,
         config,
-        train_env: Union[envs_v1.Env, envs.Env],
-        eval_env: Optional[Union[envs_v1.Env, envs.Env]] = None,
+        train_env: envs.Env,
+        eval_env: Optional[envs.Env] = None,
         randomization_fn: Optional[
             Callable[[base.System, jnp.ndarray], Tuple[base.System, base.System]]
         ] = None,
@@ -188,10 +187,7 @@ class PPO:
             randomization_rng = jax.random.split(key_env, randomization_batch_size)
             v_randomization_fn = functools.partial(randomization_fn, rng=randomization_rng)
 
-        if isinstance(train_env, envs.Env):
-            wrap_for_training = envs.training.wrap
-        else:
-            wrap_for_training = envs_v1.wrappers.wrap_for_training
+        wrap_for_training = envs.training.wrap
 
         env = train_env
         env = TrajectoryIdWrapper(env)
