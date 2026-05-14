@@ -33,7 +33,6 @@ from brax.training.acme.types import NestedArray
 from brax.training.agents.sac import losses as sac_losses
 from brax.training.replay_buffers_test import jit_wrap
 from brax.training.types import Params, Policy, PRNGKey
-from brax.v1 import envs as envs_v1
 from flax.struct import dataclass
 
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
@@ -43,8 +42,8 @@ from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 from . import networks
 
 Metrics = types.Metrics
-Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
-State = Union[envs.State, envs_v1.State]
+Env = Union[envs.Env, envs.Wrapper]
+State = envs.State
 
 
 class Transition(NamedTuple):
@@ -445,8 +444,8 @@ class SAC:
     def train_fn(
         self,
         config,
-        train_env: Union[envs_v1.Env, envs.Env],
-        eval_env: Optional[Union[envs_v1.Env, envs.Env]] = None,
+        train_env: Env,
+        eval_env: Optional[Env] = None,
         randomization_fn: Optional[
             Callable[[base.System, jnp.ndarray], Tuple[base.System, base.System]]
         ] = None,
@@ -489,10 +488,7 @@ class SAC:
 
         assert config.num_envs % device_count == 0
         env = train_env
-        if isinstance(env, envs.Env):
-            wrap_for_training = envs.training.wrap
-        else:
-            wrap_for_training = envs_v1.wrappers.wrap_for_training
+        wrap_for_training = envs.training.wrap
 
         rng = jax.random.PRNGKey(config.seed)
         rng, key = jax.random.split(rng)
@@ -762,7 +758,7 @@ class SAC:
             env_state: envs.State,
             buffer_state: ReplayBufferState,
             key: PRNGKey,
-        ) -> Tuple[TrainingState, Union[envs.State, envs_v1.State], ReplayBufferState, Metrics]:
+        ) -> Tuple[TrainingState, State, ReplayBufferState, Metrics]:
             experience_key, training_key = jax.random.split(key)
             policy_inf_params = _get_policy_inference_params(training_state)
             normalizer_params, env_state, buffer_state = get_experience(
