@@ -131,14 +131,18 @@
           ];
           extraMounts = extraMountsCommon;
 
-          # This is what runs INSIDE the FHS env when devshell starts
+          # This is what runs INSIDE the FHS env when devshell starts.
+          # With arguments it runs them and exits (e.g. `nix run .#fhs-dev -- python run.py ...`),
+          # without arguments it drops into an interactive shell.
           runScript = pkgs.writeShellScript "dev-entry" ''
             set -euo pipefail
             echo "[dev] cwd at startup: $PWD"
 
-            # Ensure venv exists (only sync if .venv missing)
-            echo "[dev] running: uv sync --python 3.13"
-	          uv sync --python 3.13 --extra cuda13
+            # Ensure venv exists / is up to date. Set JAXGCRL_SKIP_SYNC=1 to skip (e.g. offline).
+            if [ "''${JAXGCRL_SKIP_SYNC:-0}" != "1" ]; then
+              echo "[dev] running: uv sync --python 3.13 --extra cuda13"
+              uv sync --python 3.13 --extra cuda13
+            fi
 
             # "Activate" the venv by mutating PATH + VIRTUAL_ENV
             if [ -d ".venv/bin" ]; then
@@ -149,9 +153,25 @@
               echo "[dev] WARNING: .venv/bin missing; continuing without venv"
             fi
 
+            # GPU: the CUDA runtime comes from the jax[cuda13] wheels in the venv, the driver
+            # from the host (mounted /run). Keep XLA from grabbing the whole card up front.
+            export LD_LIBRARY_PATH="/run/opengl-driver/lib:''${LD_LIBRARY_PATH:-}"
+            export XLA_PYTHON_CLIENT_PREALLOCATE="''${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
+            export MUJOCO_GL="''${MUJOCO_GL:-egl}"
+
+            if [ "$#" -gt 0 ]; then
+              exec "$@"
+            fi
+
             echo "[dev] dropping into interactive bash"
-            bash
+            exec bash
           '';
+        };
+
+        # `nix run .` -> same FHS env; pass a command after `--` to run it non-interactively.
+        apps.default = {
+          type = "app";
+          program = "${self.packages.${system}.fhs-dev}/bin/fhs-ubuntu-dev";
         };
 
 	devShells.default = pkgs.mkShell {

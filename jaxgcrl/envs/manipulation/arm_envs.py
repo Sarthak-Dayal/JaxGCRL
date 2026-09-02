@@ -1,8 +1,14 @@
+from pathlib import Path
+
 import jax
 from brax import base
 from brax.envs.base import PipelineEnv, State
 from brax.io import mjcf
 from jax import numpy as jnp
+
+# Assets ship inside the package (see `[tool.setuptools.package-data]`), so resolve them relative
+# to this file rather than the working directory.
+ASSETS = Path(__file__).resolve().parents[1] / "assets"
 
 
 class ArmEnvs(PipelineEnv):

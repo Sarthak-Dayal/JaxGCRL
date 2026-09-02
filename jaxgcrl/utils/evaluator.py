@@ -119,6 +119,11 @@ class ActorEvaluator:
             # (np.min, "_min"),
         ]
 
+        # Envs differ in what they report -- reacher has no `success_easy`, cheetah no
+        # `distance_from_origin` -- so take whichever of these the env actually emits.
+        wanted = ["reward", "success", "success_easy", "dist", "distance_from_origin"]
+        available = [name for name in wanted if name in eval_metrics.episode_metrics]
+
         for fn, suffix in aggregating_fns:
             metrics.update(
                 {
@@ -127,13 +132,7 @@ class ActorEvaluator:
                         if aggregate_episodes
                         else eval_metrics.episode_metrics[name]
                     )
-                    for name in [
-                        "reward",
-                        "success",
-                        "success_easy",
-                        "dist",
-                        "distance_from_origin",
-                    ]
+                    for name in available
                 }
             )
 

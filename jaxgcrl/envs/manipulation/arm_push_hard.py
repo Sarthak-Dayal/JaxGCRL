@@ -2,7 +2,7 @@ import jax
 from brax import base
 from jax import numpy as jnp
 
-from .arm_envs import ArmEnvs
+from .arm_envs import ASSETS, ArmEnvs
 
 """
 Push-Hard: Move a cube from a random location on the blue region to a random goal on the red region. The regions are moderately-sized.
@@ -15,7 +15,7 @@ See _get_obs() and ArmEnvs._convert_action() for details.
 
 class ArmPushHard(ArmEnvs):
     def _get_xml_path(self):
-        return "envs/assets/panda_push_hard.xml"
+        return str(ASSETS / "panda_push_hard.xml")
 
     @property
     def action_size(self) -> int:

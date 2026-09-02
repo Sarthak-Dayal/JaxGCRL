@@ -319,3 +319,7 @@ experiments/
 notebooks/data/
 notebooks/figures/
 
+
+# nix build output
+result
+result-*

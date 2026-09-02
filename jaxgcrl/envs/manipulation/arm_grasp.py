@@ -2,7 +2,7 @@ import jax
 from brax import base
 from jax import numpy as jnp
 
-from .arm_envs import ArmEnvs
+from .arm_envs import ASSETS, ArmEnvs
 
 """
 Grasp: Close fingers on opposite sides of a cube.
@@ -15,7 +15,7 @@ See _get_obs() and ArmEnvs._convert_action() for details.
 
 class ArmGrasp(ArmEnvs):
     def _get_xml_path(self):
-        return "envs/assets/panda_grasp.xml"
+        return str(ASSETS / "panda_grasp.xml")
 
     @property
     def action_size(self) -> int:

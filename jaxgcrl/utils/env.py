@@ -51,7 +51,8 @@ legal_envs = (
     "arm_push_hard",
     "arm_binpick_easy",
     "arm_binpick_hard",
-    "ant_ball_maze",
+    "ant_ball_u_maze",
+    "ant_ball_big_maze",
     "ant_u_maze",
     "ant_big_maze",
     "ant_hardest_maze",
@@ -177,7 +178,8 @@ class MetricsRecorder:
 
     Parameters:
     total_env_steps (int): The maximum number of timesteps for recording metrics.
-    metrics_to_collect (List[str]): List of metric names that are to be collected.
+    metrics_to_print (List[str]): Metric names to echo to stdout each eval. Everything an
+        agent returns is recorded and logged to wandb; this only trims the console output.
     exp_dir (str): Directory to save renders to.
     exp_name (str): Experiment name for naming rendered trajectory visualizations.
     """
@@ -185,7 +187,7 @@ class MetricsRecorder:
     def __init__(
         self,
         total_env_steps: int,
-        metrics_to_collect: List[str],
+        metrics_to_print: List[str],
         exp_dir,
         exp_name,
         mode,
@@ -194,7 +196,7 @@ class MetricsRecorder:
         self.y_data = {}
         self.y_data_err = {}
         self.times = [datetime.now()]
-        self.metrics_to_collect = metrics_to_collect
+        self.metrics_to_print = metrics_to_print
         self.exp_dir = exp_dir
         self.exp_name = exp_name
         self.mode = mode
@@ -253,9 +255,13 @@ class MetricsRecorder:
         plt.show()
 
     def print_progress(self):
-        for idx, (key, y_values) in enumerate(self.y_data.items()):
+        """Echo the short list to stdout. Everything else is still recorded and sent to wandb."""
+        for key in self.metrics_to_print:
+            if key not in self.y_data:
+                continue
             logging.info(
-                f"step: {self.x_data[-1]}, {key}: {y_values[-1]:.3f} +/- {self.y_data_err[key][-1]:.3f}"
+                f"step: {self.x_data[-1]}, {key}: {self.y_data[key][-1]:.3f} "
+                f"+/- {self.y_data_err[key][-1]:.3f}"
             )
 
     def print_times(self):
@@ -263,16 +269,16 @@ class MetricsRecorder:
         logging.info(f"time to train: {self.times[-1] - self.times[1]}")
 
     def progress(self, num_steps, metrics, make_policy, params, env, do_render=True):
-        for key in self.metrics_to_collect:
+        for key in self.metrics_to_print:
             self.ensure_metric(metrics, key)
 
         if do_render:
             render(make_policy, params, env, self.exp_dir, self.exp_name, num_steps)
 
-        self.record(
-            num_steps,
-            {key: value for key, value in metrics.items() if key in self.metrics_to_collect},
-        )
+        # Record everything the agent returned; `metrics_to_print` only trims what is echoed
+        # below. This also keeps the `{key}_std` companions the evaluators emit, which the old
+        # filter stripped before `record` could pair them up.
+        self.record(num_steps, metrics)
         self.log_wandb()
         self.print_progress()
 

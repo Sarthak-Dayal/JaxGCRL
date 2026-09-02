@@ -52,6 +52,7 @@ def main(config: Config):
         project=config.run.wandb_project_name,
         group=config.run.wandb_group,
         name=config.run.exp_name,
+        tags=[tag for tag in config.run.wandb_tags.split(",") if tag],
         config=info,
         mode="online" if config.run.log_wandb else "disabled",
     )
@@ -70,7 +71,7 @@ def main(config: Config):
     with open(run_dir + "/args.pkl", "wb") as f:
         pickle.dump(vars(config), f)
 
-    metrics_to_collect = [
+    eval_metrics = [
         "eval/episode_dist",
         "eval/episode_reward",
         "eval/episode_reward_ctrl",
@@ -81,17 +82,17 @@ def main(config: Config):
         "eval/episode_success_any",
         "eval/episode_success_easy",
         "eval/episode_success_hard",
-        "training/actor_loss",
-        "training/log_alpha",
-        "training/alpha_loss",
-        "training/critic_loss",
-        "training/entropy",
-        "training/sps",
     ]
+    # Everything an agent returns is recorded and logged to wandb; this list only decides what
+    # is echoed to stdout each eval, and which keys are NaN-checked. An agent names the training
+    # metrics it produces via `metrics_to_log`; the rest fall back to the SAC-derived set.
+    default_training_metrics = ["actor_loss", "log_alpha", "alpha_loss", "critic_loss", "entropy", "sps"]
+    training_metrics = getattr(config.agent, "metrics_to_log", default_training_metrics)
+    metrics_to_print = eval_metrics + [f"training/{name}" for name in training_metrics]
 
     metrics_recorder = MetricsRecorder(
         config.run.total_env_steps,
-        metrics_to_collect,
+        metrics_to_print,
         run_dir,
         config.run.exp_name,
         mode=config.run.wandb_mode,

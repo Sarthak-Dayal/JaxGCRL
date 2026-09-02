@@ -2,7 +2,7 @@ import jax
 from brax import base
 from jax import numpy as jnp
 
-from .arm_envs import ArmEnvs
+from .arm_envs import ASSETS, ArmEnvs
 
 """
 Reach: Move end of arm to random goal.
@@ -15,7 +15,7 @@ See _get_obs() and ArmEnvs._convert_action() for details.
 
 class ArmReach(ArmEnvs):
     def _get_xml_path(self):
-        return "envs/assets/panda_reach.xml"
+        return str(ASSETS / "panda_reach.xml")
 
     @property
     def action_size(self) -> int:

@@ -202,6 +202,8 @@ We currently support following algorithms:
 | [SAC + HER](https://arxiv.org/abs/1707.01495)   | `python run.py sac ... --use_her`       | [link](./jaxgcrl/agents/sac/)                      |
 | [TD3](https://arxiv.org/pdf/1802.09477)         | `python run.py td3 ...`                 | [link](./jaxgcrl/agents/td3/)                      |
 | [TD3 + HER](https://arxiv.org/abs/1707.01495)   | `python run.py td3 ... --use_her`       | [link](./jaxgcrl/agents/td3/)                      |
+| [HIQL](https://arxiv.org/abs/2307.11949)        | `python run.py hiql ...`                | [link](./jaxgcrl/agents/hiql/)                     |
+| Q-CARL                                          | `python run.py qcarl ...`               | [link](./jaxgcrl/agents/qcarl/)                    |
 
 
 ## Code Structure 📝

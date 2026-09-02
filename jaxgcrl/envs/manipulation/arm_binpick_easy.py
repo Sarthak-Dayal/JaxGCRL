@@ -2,7 +2,7 @@ import jax
 from brax import base
 from jax import numpy as jnp
 
-from .arm_envs import ArmEnvs
+from .arm_envs import ASSETS, ArmEnvs
 
 """
 Binpick-Easy: Move a cube from a random location in the blue bin to the center of the red bin.
@@ -15,7 +15,7 @@ See _get_obs() and ArmEnvs._convert_action() for details.
 
 class ArmBinpickEasy(ArmEnvs):
     def _get_xml_path(self):
-        return "envs/assets/panda_binpick_easy.xml"
+        return str(ASSETS / "panda_binpick_easy.xml")
 
     @property
     def action_size(self) -> int:
