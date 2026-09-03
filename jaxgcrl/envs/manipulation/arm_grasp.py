@@ -31,6 +31,8 @@ class ArmGrasp(ArmEnvs):
         )  # Left and right fingertip positions, and fingertip distance
         self.completion_goal_indices = jnp.array([16, 17, 18, 19, 20, 21, 22])  # Identical
         self.state_dim = 24
+        # Matches the cube-to-fingertip distance this env counts as a grasp.
+        self.goal_reach_thresh = 0.05
 
         self.arm_noise_scale = 0
         self.cube_noise_scale = 0.3
@@ -82,7 +84,7 @@ class ArmGrasp(ArmEnvs):
             jnp.all(
                 jnp.array(
                     [
-                        cube_to_fingertip_midpoint_dist < 0.05,
+                        cube_to_fingertip_midpoint_dist < self.goal_reach_thresh,
                         gripper_openness_difference < 0.02,
                     ]
                 )

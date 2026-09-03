@@ -77,9 +77,15 @@ def make_losses(
         new_actions = policy_network.apply(normalizer_params, policy_params, transitions.observation)
         q_new_actions = q_network.apply(normalizer_params, q_params, transitions.observation, new_actions)
         q_new_actions, _ = jnp.split(q_new_actions, 2, axis=-1)
-        lmbda = jax.lax.stop_gradient(bc * alpha / jnp.mean(jnp.abs(q_new_actions)) + (1 - bc))
+        # `bc` is a Python bool known at trace time, so branch rather than gate arithmetically:
+        # the old `bc * alpha / mean(|Q|) + (1 - bc)` evaluated the division even when bc was
+        # False. Nothing in this repo passes bc, so only the first branch runs today.
         q_mean = jnp.mean(q_new_actions)
-        return -lmbda * q_mean + bc * mean_squared_error(new_actions, transitions.action)
+        if not bc:
+            return -q_mean
+
+        lmbda = jax.lax.stop_gradient(alpha / jnp.mean(jnp.abs(q_new_actions)))
+        return -lmbda * q_mean + mean_squared_error(new_actions, transitions.action)
 
     def mean_squared_error(predictions, targets):
         return jnp.mean(jnp.square(predictions - targets))

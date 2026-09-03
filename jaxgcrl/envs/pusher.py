@@ -163,6 +163,8 @@ class PusherReacher(PipelineEnv):
 
         self.state_dim = 17
         self.goal_indices = jnp.array([14, 15, 16])
+        # Same threshold as the sibling `Pusher` env.
+        self.goal_reach_thresh = 0.1
 
     def reset(self, rng: jax.Array) -> State:
         qpos = self.sys.init_q
@@ -228,7 +230,7 @@ class PusherReacher(PipelineEnv):
             reward_near=0.0,
             reward_dist=reward_dist,
             reward_ctrl=0.0,
-            success=jnp.array(arm_to_goal_dist < 0.1, dtype=float),
+            success=jnp.array(arm_to_goal_dist < self.goal_reach_thresh, dtype=float),
             success_hard=jnp.array(arm_to_goal_dist < 0.05, dtype=float),
         )
         return state.replace(pipeline_state=pipeline_state, obs=obs, reward=reward)

@@ -220,6 +220,8 @@ class HumanoidMaze(PipelineEnv):
 
         self.state_dim = 268
         self.goal_indices = jnp.array([0, 1, 2])
+        # Matches the threshold this env reports success at (see `step`).
+        self.goal_reach_thresh = 0.5
 
     def reset(self, rng: jax.Array) -> State:
         """Resets the environment to an initial state."""
@@ -290,7 +292,7 @@ class HumanoidMaze(PipelineEnv):
 
         done = 1.0 - is_healthy if self._terminate_when_unhealthy else 0.0
         reward = -distance_to_target + healthy_reward - ctrl_cost
-        success = jnp.array(distance_to_target < 0.5, dtype=float)
+        success = jnp.array(distance_to_target < self.goal_reach_thresh, dtype=float)
         success_easy = jnp.array(distance_to_target < 2.0, dtype=float)
         state.metrics.update(
             forward_reward=forward_reward,

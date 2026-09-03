@@ -17,7 +17,7 @@
 import functools
 import logging
 import time
-from typing import Any, Callable, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Literal, NamedTuple, Optional, Sequence, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -88,57 +88,99 @@ ReplayBufferState = Any
 _PMAP_AXIS_NAME = "i"
 
 
+def relabel_goals(env, transition: Transition, goal_idx: jnp.ndarray) -> Transition:
+    """Swap each step's commanded goal for the one achieved at `goal_idx`, and rescore it.
+
+    An observation is [state | commanded goal], and obs[goal_indices] is the goal a step actually
+    achieved, so relabeling is a slice and a concatenate. The reward has to be recomputed because
+    the one in the buffer was scored against the goal being replaced.
+    """
+    new_goals = transition.observation[goal_idx][:, env.goal_indices]
+    new_obs = jnp.concatenate([transition.observation[:, : env.state_dim], new_goals], axis=1)
+    new_next_obs = jnp.concatenate(
+        [transition.next_observation[:, : env.state_dim], new_goals], axis=1
+    )
+
+    dist = jnp.linalg.norm(new_obs[:, env.state_dim :] - new_obs[:, env.goal_indices], axis=1)
+    new_reward = jnp.array(dist < env.goal_reach_thresh, dtype=float)
+
+    return transition._replace(
+        observation=jnp.squeeze(new_obs),
+        next_observation=jnp.squeeze(new_next_obs),
+        reward=jnp.squeeze(new_reward),
+    )
+
+
+def flatten_batch_final(env, transition: Transition) -> Transition:
+    """HER "final": every step is retold as aiming at wherever its own episode ended.
+
+    An episode ends where traj_id changes, which covers termination and timeout alike -- unlike
+    `truncation`, which brax sets as `where(steps >= episode_length, 1 - done, 0)`, i.e. on
+    timeout only, so episodes that ended early were never relabeled.
+
+        traj_id                   7  7  7  8  8  8
+        is_episode_end            .  .  1  .  .  1
+        where(end, i, seq_len)    6  6  2  6  6  5    seq_len stands in for +inf
+        reversed                  5  6  6  2  6  6
+        cummin                    5  5  5  2  2  2    the running min carries an end backwards
+        goal_idx (reversed back)  2  2  2  5  5  5    the next end at or after each step
+
+    That is a suffix minimum, computed as a reversed prefix scan. The last index is always an end,
+    so the sentinel never survives and every step resolves -- no "not found" case to fall back on.
+    """
+    seq_len = transition.observation.shape[0]
+    arrangement = jnp.arange(seq_len)
+    traj_ids = transition.extras["state_extras"]["traj_id"]
+
+    is_episode_end = jnp.concatenate(
+        [traj_ids[:-1] != traj_ids[1:], jnp.ones((1,), dtype=bool)]
+    )
+    goal_idx = jax.lax.cummin(jnp.where(is_episode_end, arrangement, seq_len)[::-1])[::-1]
+    return relabel_goals(env, transition, goal_idx)
+
+
+def flatten_batch_geometric(env, transition: Transition, gamma: float, sample_key: PRNGKey) -> Transition:
+    """HER with a future goal sampled at weight gamma ** (j - i), as CRL relabels.
+
+    Weighting future steps by gamma ** (j - i) makes the goals the discounted state occupancy of
+    the behaviour policy, which is the distribution the gamma-discounted value function is defined
+    against -- so this is the agent's own `discounting`, not a separate knob.
+
+    With seq_len = 6, traj_id = [7 7 7 8 8 8] and gamma = 0.9:
+
+        is_future & same_trajectory     gamma ** (j - i)       probs = product + eye * 1e-5
+          .  1  1  .  .  .              1 .9 .81 .73 .66 .59     e  .9 .81  .  .   .
+          .  .  1  .  .  .              . 1  .9  .81 .73 .66     .  e  .9   .  .   .
+          .  .  .  .  .  .              . .  1   .9  .81 .73     .  .  e    .  .   .
+          .  .  .  .  1  1              . .  .   1   .9  .81     .  .  .    e  .9 .81
+          .  .  .  .  .  1              . .  .   .   1   .9      .  .  .    .  e  .9
+          .  .  .  .  .  .              . .  .   .   .   1       .  .  .    .  .   e
+
+    `categorical` normalizes each row, so step 0 draws step 1 with probability .9/1.71 = 0.53 and
+    step 2 with .81/1.71 = 0.47. Rows 2 and 5 end their episode and have no future, so only the
+    e = 1e-5 diagonal is left and they draw themselves -- the same role the diagonal plays in
+    `flatten_batch_final`, and what keeps `jnp.log(probs)` off an all-zero row.
+    """
+    seq_len = transition.observation.shape[0]
+    arrangement = jnp.arange(seq_len)
+    traj_ids = transition.extras["state_extras"]["traj_id"]
+
+    same_trajectory = traj_ids[:, None] == traj_ids[None, :]
+    is_future = arrangement[:, None] < arrangement[None, :]
+    decay = gamma ** jnp.array(arrangement[None] - arrangement[:, None], dtype=jnp.float32)
+
+    probs = is_future * same_trajectory * decay + jnp.eye(seq_len) * 1e-5
+    goal_idx = jax.random.categorical(sample_key, jnp.log(probs))
+    return relabel_goals(env, transition, goal_idx)
+
+
 @functools.partial(jax.jit, static_argnames=["config", "env"])
 def flatten_batch(config, env, transition: Transition, sample_key: PRNGKey) -> Transition:
-    if config.use_her:
-        # Find truncation indexes if present
-        seq_len = transition.observation.shape[0]
-        arrangement = jnp.arange(seq_len)
-        is_future_mask = jnp.array(arrangement[:, None] < arrangement[None], dtype=jnp.float32)
-        single_trajectories = jnp.concatenate(
-            [transition.extras["state_extras"]["traj_id"][:, jnp.newaxis].T] * seq_len,
-            axis=0,
-        )
-
-        # final_step_mask.shape == (seq_len, seq_len)
-        final_step_mask = (
-            is_future_mask * jnp.equal(single_trajectories, single_trajectories.T) + jnp.eye(seq_len) * 1e-5
-        )
-        final_step_mask = jnp.logical_and(
-            final_step_mask,
-            transition.extras["state_extras"]["truncation"][None, :],
-        )
-        non_zero_columns = jnp.nonzero(final_step_mask, size=seq_len)[1]
-
-        # If final state is not present use original goal (i.e. don't change anything)
-        new_goals_idx = jnp.where(non_zero_columns == 0, arrangement, non_zero_columns)
-        binary_mask = jnp.logical_and(non_zero_columns, non_zero_columns)
-
-        new_goals = (
-            binary_mask[:, None] * transition.observation[new_goals_idx][:, env.goal_indices]
-            + jnp.logical_not(binary_mask)[:, None]
-            * transition.observation[new_goals_idx][:, env.state_dim :]
-        )
-
-        # Transform observation
-        state = transition.observation[:, : env.state_dim]
-        new_obs = jnp.concatenate([state, new_goals], axis=1)
-
-        # Recalculate reward
-        dist = jnp.linalg.norm(new_obs[:, env.state_dim :] - new_obs[:, env.goal_indices], axis=1)
-        new_reward = jnp.array(dist < env.goal_reach_thresh, dtype=float)
-
-        # Transform next observation
-        next_state = transition.next_observation[:, : env.state_dim]
-        new_next_obs = jnp.concatenate([next_state, new_goals], axis=1)
-
-        return transition._replace(
-            observation=jnp.squeeze(new_obs),
-            next_observation=jnp.squeeze(new_next_obs),
-            reward=jnp.squeeze(new_reward),
-        )
-
-    return transition
+    if not config.use_her:
+        return transition
+    if config.her_goal_sampling == "geometric":
+        return flatten_batch_geometric(env, transition, config.discounting, sample_key)
+    return flatten_batch_final(env, transition)
 
 
 @dataclass
@@ -212,6 +254,10 @@ class TD3:
     smoothing_noise: int = 0.2
     exploration_noise: float = 0.4
     use_her: bool = False
+    # Which future state HER relabels with: "final" is the last state of the step's own episode,
+    # "geometric" samples a future state of that episode with weight discounting ** (j - i),
+    # matching how CRL picks its goals.
+    her_goal_sampling: Literal["final", "geometric"] = "final"
 
     def train_fn(
         self,
