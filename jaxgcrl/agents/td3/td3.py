@@ -114,28 +114,29 @@ def relabel_goals(env, transition: Transition, goal_idx: jnp.ndarray) -> Transit
 def flatten_batch_final(env, transition: Transition) -> Transition:
     """HER "final": every step is retold as aiming at wherever its own episode ended.
 
-    An episode ends where traj_id changes, which covers termination and timeout alike -- unlike
-    `truncation`, which brax sets as `where(steps >= episode_length, 1 - done, 0)`, i.e. on
-    timeout only, so episodes that ended early were never relabeled.
+    Steps are grouped by traj_id, which changes at every reset and so covers termination and
+    timeout alike -- unlike `truncation`, which brax sets as
+    `where(steps >= episode_length, 1 - done, 0)`, i.e. on timeout only, leaving episodes that
+    ended early with nothing to relabel against.
 
-        traj_id                   7  7  7  8  8  8
-        is_episode_end            .  .  1  .  .  1
-        where(end, i, seq_len)    6  6  2  6  6  5    seq_len stands in for +inf
-        reversed                  5  6  6  2  6  6
-        cummin                    5  5  5  2  2  2    the running min carries an end backwards
-        goal_idx (reversed back)  2  2  2  5  5  5    the next end at or after each step
+    The goal for step i is the largest index in i's own episode. With traj_id = [7 7 7 8 8 8]:
 
-    That is a suffix minimum, computed as a reversed prefix scan. The last index is always an end,
-    so the sentinel never survives and every step resolves -- no "not found" case to fall back on.
+        same_trajectory      where(same_trajectory, j, -1)     max over j
+          1 1 1 . . .           0  1  2 -1 -1 -1                   2
+          1 1 1 . . .           0  1  2 -1 -1 -1                   2
+          1 1 1 . . .           0  1  2 -1 -1 -1                   2
+          . . . 1 1 1          -1 -1 -1  3  4  5                   5
+          . . . 1 1 1          -1 -1 -1  3  4  5                   5
+          . . . 1 1 1          -1 -1 -1  3  4  5                   5
+
+    Every row contains i itself, so the max is always a real index and there is no "not found"
+    case to fall back on.
     """
-    seq_len = transition.observation.shape[0]
-    arrangement = jnp.arange(seq_len)
+    arrangement = jnp.arange(transition.observation.shape[0])
     traj_ids = transition.extras["state_extras"]["traj_id"]
 
-    is_episode_end = jnp.concatenate(
-        [traj_ids[:-1] != traj_ids[1:], jnp.ones((1,), dtype=bool)]
-    )
-    goal_idx = jax.lax.cummin(jnp.where(is_episode_end, arrangement, seq_len)[::-1])[::-1]
+    same_trajectory = traj_ids[:, None] == traj_ids[None, :]
+    goal_idx = jnp.max(jnp.where(same_trajectory, arrangement[None, :], -1), axis=1)
     return relabel_goals(env, transition, goal_idx)
 
 

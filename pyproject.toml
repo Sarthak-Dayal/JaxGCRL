@@ -28,6 +28,9 @@ cuda12 = [
 cuda13 = [
   "jax[cuda13]==0.9.1; platform_system == 'Linux'",
 ]
+dev = [
+  "ty>=0.0.1a1",
+]
 
 [project.scripts]
 jaxgcrl = "run:cli"
@@ -46,6 +49,16 @@ py-modules = [ "run" ]
 
 [tool.setuptools.package-data]
 "jaxgcrl.envs" = ["**/assets/*"]
+
+[tool.ty.environment]
+python-version = "3.13"
+
+[tool.ty.rules]
+# flax's `Module.apply` is annotated as returning the output *or* (output, mutated_vars), so any
+# call without `mutable=` reads as a union that never matches the array ops downstream. The
+# project is otherwise untyped, so leave this off until there is something for it to catch.
+invalid-argument-type = "ignore"
+invalid-return-type = "ignore"
 
 [tool.ruff]
 line-length = 110
