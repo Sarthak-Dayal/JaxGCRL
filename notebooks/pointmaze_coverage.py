@@ -2,10 +2,10 @@
 much is the data, when the state is a position and the action a displacement.
 
 Same design as `coverage_study.py`. Every critic is trained on relabeled trajectories from a
-noisy waypoint navigator -- it heads for a random point of the maze along the geodesic and
-picks another on arrival, acting randomly on a `1/D` share of its steps -- so D = 1 is a random
-walk and D = 4 already crosses the world (`uniform` draws state, action and goal independently).
-Critics are scored against the geodesic
+noisy waypoint navigator that heads for random points along the geodesic and picks another on
+arrival; the dial D is the radius around the start its waypoints are drawn from, so D = 1 is a
+blob around the start and D = 64 the whole world (`uniform` draws state, action and goal
+independently). Critics are scored against the geodesic
 distance around the walls: a greedy action counts as a good pick when it makes at least half
 the progress toward the goal that the best of the candidate actions would have made.
 
@@ -204,9 +204,9 @@ def _(C, P, W, grid_figure, heatmap, horizon, mo, n_traj, np, star, start):
         mo.hstack([start, n_traj, horizon], justify="start", gap=1),
         mo.md(f"Visits per cell. {n_traj.value} walks of {horizon.value} steps, every one "
               f"starting at the centre of cell {start.value} = row {_sr}, col {_sc} (the star). "
-              f"The walker navigates to random waypoints along the geodesic; a 1/D share of its "
-              f"steps are random instead, so D=1 is a random walk. Past D=4 the relabeling "
-              f"horizon, not the walk, caps how far a state is from its goal."),
+              f"The walker navigates to random waypoints along the geodesic, with a quarter of "
+              f"its steps random; D is the radius around the start, in cells, its waypoints are "
+              f"drawn from."),
         _fig,
     ])
     return DS, LABELS, data
