@@ -40,7 +40,13 @@ def _():
     import marimo as mo
     import numpy as np
     import plotly.graph_objects as go
+    import plotly.io as pio
     from plotly.subplots import make_subplots
+
+    # marimo's dark theme switches plotly's default template to plotly_dark, which puts white
+    # text on these white-background figures; every figure pins plotly_white, and this makes
+    # it the default too
+    pio.templates.default = "plotly_white"
 
     import gridworld as G
     from gridworld import coverage as C
