@@ -8,6 +8,7 @@ self-contained (they do not import from `jaxgcrl`).
 | notebook | what it studies |
 |---|---|
 | `coverage_study.py` | How much of a critic's accuracy is the objective, and how much is the data it was shown. Three factorizations (monolithic, CRL's `sa_g`, CARL's `sg_a`) under TD, contrastive (InfoNCE, binary NCE) and oracle-regression objectives, trained on datasets of controllable coverage in a maze, then scaled over network size. |
+| `pointmaze_coverage.py` | The same study in a continuous point maze, with a choice of topology (tree maze, braided maze with loops, rooms). Same controls and figures; run it the same way. |
 | `gridworld_carl.py` | CARL against its baselines on a gridworld, including action chunking. |
 | `pointmaze_carl.py` | The same comparison on a continuous point maze. |
 | `q_landscape.py`, `render_runs.py` | Inspecting trained `jaxgcrl` runs. |

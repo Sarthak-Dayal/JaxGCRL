@@ -50,7 +50,7 @@ def _(mo):
 
 @app.cell
 def _(P, chunk, mo, n_cand, seed, shaping, size, steps, train):
-    W = P.build_world(size.value, seed=seed.value)
+    W = P.build_world(n=size.value, seed=seed.value)
     trained, results, floor = {}, {}, 0.0
 
     if train.value:
@@ -60,14 +60,14 @@ def _(P, chunk, mo, n_cand, seed, shaping, size, steps, train):
                 trained = _out
                 _bar.update()
         results = {_k: P.evaluate(W, _v, n_eval=150, n_probe=250) for _k, _v in trained.items()}
-        floor = P.random_alignment(W)
+        floor = P.random_floor(W, next(iter(trained.values()))["cand"])
 
     mo.md(
         f"Point maze {W['n']}x{W['n']}, {len(W['free_cells'])} open cells, step {W['step']}, "
         f"goal radius {W['goal_radius']}. "
         + (f"Trained **{len(trained)}** critics, {steps.value} steps each, over a pool of "
            f"{n_cand.value} candidate chunks. A uniformly random action scores "
-           f"**{floor:+.3f}** on alignment, which is the floor the bars sit on."
+           f"**{floor:.2f}** on the good-pick share, which is the floor the bars sit on."
            if trained else "Press **train all eight critics**.")
     )
     return W, floor, results, trained
@@ -90,7 +90,7 @@ def _(floor, mo, plt, results, trained):
                 else "#777" for k in names]
         fig, axes = plt.subplots(1, 2, figsize=(11, 3.8), constrained_layout=True)
         for ax, key, title in [(axes[0], "success", "success rate"),
-                               (axes[1], "align", "alignment with the geodesic descent direction")]:
+                               (axes[1], "agree", "share of picks making half the best progress")]:
             vals = [results[k][key] for k in names]
             ax.bar(range(len(names)), vals, color=cols)
             ax.set_xticks(range(len(names)))
@@ -146,21 +146,17 @@ def _(P, W, goal_pick, mo, np, plt, trained):
 
     def _figure():
         goal = P.sample_positions(W, 20, np.random.default_rng(7))[int(goal_pick.value)]
-        ideal_pos, ideal_vec = P.ideal_field(W, goal)
-        panels = [("ideal descent", ideal_pos, ideal_vec)]
+        pos = P.cell_grid(W)
+        panels = [("ideal descent", pos, P.ideal_field(W, goal), None)]
         for name, e in trained.items():
-            pos, vec = P.action_field(W, e, goal)
-            panels.append((name, pos, vec))
+            vec, good = P.action_field(W, e, goal)
+            panels.append((name, pos, vec, good))
 
         fig, axes = plt.subplots(3, 3, figsize=(9.6, 9.8), constrained_layout=True)
-        for ax, (name, pos, vec) in zip(axes.ravel(), panels):
+        for ax, (name, pos, vec, good) in zip(axes.ravel(), panels):
             ax.imshow(np.where(W["walls"], 1.0, np.nan), cmap="Greys", vmin=0, vmax=1,
                       extent=[0, W["n"], W["n"], 0])
-            if name == "ideal descent":
-                col = "#2a7d4f"
-            else:
-                col = np.where((vec * P.descent_direction(
-                    W, P.geodesic_field(W, goal), pos)).sum(-1) > 0.3, "#2a7d4f", "#c0392b")
+            col = "#2a7d4f" if good is None else np.where(good, "#2a7d4f", "#c0392b")
             ax.quiver(pos[:, 1], pos[:, 0], vec[:, 1], vec[:, 0], color=col,
                       angles="xy", scale_units="xy", scale=2.0, width=0.007)
             ax.plot(goal[1], goal[0], "*", color="gold", ms=13, mec="black", mew=0.5)

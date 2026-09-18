@@ -4,6 +4,10 @@ With a continuous action space the chunk space is R^(2h), so the exact max and l
 discrete notebook become a *sampled* max over `n_cand` candidate chunks drawn uniformly from
 [-1, 1]^(2h) -- the same approximation QT-Opt makes. It keeps the setup actor-free; the cost is
 that the target is a lower bound on the true max, biased down when `n_cand` is small.
+
+Every trainer takes `batches` as one dict of stacked arrays, (steps, batch, ...) per key, and runs
+the whole loop as a single `lax.scan`. Losses come back as a list so notebook code can test them
+for truth.
 """
 
 import jax
@@ -20,7 +24,7 @@ def candidates(h, n_cand, seed=0):
     return np.random.default_rng(seed).uniform(-1, 1, (n_cand, 2 * h)).astype(np.float32)
 
 
-def train_td(build, batches, cand, kind, steps, key, alpha=0.05, tau=0.01, lr=3e-4):
+def train_td(build, batches, cand, kind, key, alpha=0.05, tau=0.01, lr=3e-4):
     # Both use clipped double-Q: SAC takes the min over twin critics in its target just as TD3
     # does. With a single head the sampled max overestimates and the critic diverges -- badly
     # enough in a continuous action space to point the policy away from the goal.
@@ -46,8 +50,8 @@ def train_td(build, batches, cand, kind, steps, key, alpha=0.05, tau=0.01, lr=3e
             return alpha * (jax.nn.logsumexp(qs / alpha, -1) - jnp.log(qs.shape[-1]))
         return jnp.max(qs, -1)
 
-    @jax.jit
-    def step(params, target, opt_state, b):
+    def step(carry, b):
+        params, target, opt_state = carry
         tq = jax.lax.stop_gradient(
             b["reward"] + b["discount"] * next_value(target, b["next_state"], b["goal"]))
 
@@ -58,37 +62,70 @@ def train_td(build, batches, cand, kind, steps, key, alpha=0.05, tau=0.01, lr=3e
         upd, opt_state = opt.update(g, opt_state)
         params = optax.apply_updates(params, upd)
         target = jax.tree_util.tree_map(lambda t, p: (1 - tau) * t + tau * p, target, params)
-        return params, target, opt_state, l
+        return (params, target, opt_state), l
 
-    losses = []
-    for i in range(steps):
-        params, target, opt_state, l = step(params, target, opt_state, batches(i))
-        losses.append(float(l))
-    return params, q, losses
+    (params, _, _), losses = jax.lax.scan(step, (params, target, opt_state),
+                                          jax.device_put(batches))
+    return params, q, losses.tolist(), []
 
 
-def train_contrastive(build, batches, steps, key, lr=3e-4, logsumexp_coeff=0.1):
+def train_contrastive(build, batches, key, lr=3e-4, logsumexp_coeff=0.1, loss_fn="infonce"):
+    """Contrastive fitting over the batch: forward InfoNCE (rows normalized over the right
+    tower's entries), backward (columns, over the left tower's), symmetric, or per-pair binary
+    NCE. The logsumexp penalty is the repo's."""
     init, q, logits = build(1)
     params = init(key)
     opt = optax.adam(lr)
     opt_state = opt.init(params)
 
-    @jax.jit
-    def step(params, opt_state, b):
+    def step(carry, b):
+        params, opt_state = carry
+
         def loss(p):
             lg = logits(p, b["state"], b["goal"], b["seq"])
+            eye = jnp.eye(lg.shape[0])
+            if loss_fn == "binary_nce":
+                pos = jnp.sum((lg > 0) * eye) / jnp.sum(eye)
+                neg = jnp.sum((lg <= 0) * (1 - eye)) / jnp.sum(1 - eye)
+                return jnp.mean(eye * jax.nn.softplus(-lg) + (1 - eye) * jax.nn.softplus(lg)), \
+                    0.5 * (pos + neg)
+            acc = jnp.mean(jnp.argmax(lg, 1) == jnp.arange(lg.shape[0]))
             lse = jax.nn.logsumexp(lg, 1)
-            return -jnp.mean(jnp.diag(lg) - lse) + logsumexp_coeff * jnp.mean(lse**2)
+            fwd = -jnp.mean(jnp.diag(lg) - lse)
+            bwd = -jnp.mean(jnp.diag(lg) - jax.nn.logsumexp(lg, 0))
+            nce = {"infonce": fwd, "bwd_infonce": bwd, "sym_infonce": fwd + bwd}[loss_fn]
+            return nce + logsumexp_coeff * jnp.mean(lse**2), acc
+
+        (l, acc), g = jax.value_and_grad(loss, has_aux=True)(params)
+        upd, opt_state = opt.update(g, opt_state)
+        return (optax.apply_updates(params, upd), opt_state), (l, acc)
+
+    (params, _), (losses, accs) = jax.lax.scan(step, (params, opt_state),
+                                               jax.device_put(batches))
+    return params, q, losses.tolist(), accs.tolist()
+
+
+def train_regression(build, batches, key, lr=3e-4):
+    """Regress the architecture straight onto the optimal Q: the ceiling a given factorization
+    can reach on a given dataset."""
+    init, q, _ = build(1)
+    params = init(key)
+    opt = optax.adam(lr)
+    opt_state = opt.init(params)
+
+    def step(carry, b):
+        params, opt_state = carry
+
+        def loss(p):
+            pred = q(p, b["state"], b["goal"], b["seq"])[..., 0]
+            return jnp.mean((pred - b["q_star"]) ** 2)
 
         l, g = jax.value_and_grad(loss)(params)
         upd, opt_state = opt.update(g, opt_state)
-        return optax.apply_updates(params, upd), opt_state, l
+        return (optax.apply_updates(params, upd), opt_state), l
 
-    losses = []
-    for i in range(steps):
-        params, opt_state, l = step(params, opt_state, batches(i))
-        losses.append(float(l))
-    return params, q, losses
+    (params, _), losses = jax.lax.scan(step, (params, opt_state), jax.device_put(batches))
+    return params, q, losses.tolist(), []
 
 
 def train_all(W, h, steps, batch=256, seed=0, shaping=0.0, n_cand=64, n_traj=300, horizon=None):
@@ -96,25 +133,25 @@ def train_all(W, h, steps, batch=256, seed=0, shaping=0.0, n_cand=64, n_traj=300
     P, A = collect(W, n_traj=n_traj, T=horizon)
     B1 = make_batches(W, P, A, 1, steps, batch, shaping=shaping)
     Bh = make_batches(W, P, A, h, steps, batch, shaping=shaping)
-    take = lambda B: (lambda i: {k: jnp.asarray(v[i]) for k, v in B.items()})
     c1, ch = candidates(1, n_cand), candidates(h, n_cand)
+    scale = 1.0 / W["n"]
 
     specs = [
-        ("CRL",       sa_g_bilinear(1, energy="norm"), take(B1), "contrastive", c1),
-        ("CARL-CRL",  sg_a_bilinear(h, energy="norm"), take(Bh), "contrastive", ch),
-        ("SAC",       monolithic(1),                   take(B1), "sac", c1),
-        ("sa_g_sac",  sa_g_bilinear(1, energy="dot"),  take(B1), "sac", c1),
-        ("CARL-SAC",  sg_a_bilinear(h, energy="dot"),  take(Bh), "sac", ch),
-        ("TD3",       monolithic(1),                   take(B1), "td3", c1),
-        ("sa_g_td3",  sa_g_bilinear(1, energy="dot"),  take(B1), "td3", c1),
-        ("CARL-TD3",  sg_a_bilinear(h, energy="dot"),  take(Bh), "td3", ch),
+        ("CRL",       sa_g_bilinear(1, scale, energy="norm"), B1, "contrastive", c1),
+        ("CARL-CRL",  sg_a_bilinear(h, scale, energy="norm"), Bh, "contrastive", ch),
+        ("SAC",       monolithic(1, scale),                   B1, "sac", c1),
+        ("sa_g_sac",  sa_g_bilinear(1, scale, energy="dot"),  B1, "sac", c1),
+        ("CARL-SAC",  sg_a_bilinear(h, scale, energy="dot"),  Bh, "sac", ch),
+        ("TD3",       monolithic(1, scale),                   B1, "td3", c1),
+        ("sa_g_td3",  sa_g_bilinear(1, scale, energy="dot"),  B1, "td3", c1),
+        ("CARL-TD3",  sg_a_bilinear(h, scale, energy="dot"),  Bh, "td3", ch),
     ]
     out = {}
     for i, (name, build, batches, kind, cand) in enumerate(specs):
         key = jax.random.PRNGKey(seed + i)
         if kind == "contrastive":
-            p, q, losses = train_contrastive(build, batches, steps, key)
+            p, q, losses, _ = train_contrastive(build, batches, key)
         else:
-            p, q, losses = train_td(build, batches, cand, kind, steps, key)
+            p, q, losses, _ = train_td(build, batches, cand, kind, key)
         out[name] = dict(params=p, q=q, cand=cand, losses=losses, data=(P, A))
         yield name, out
