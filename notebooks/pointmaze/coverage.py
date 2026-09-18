@@ -1,16 +1,18 @@
 """Data distributions of controllable coverage in the continuous maze, from random to full.
 
 The continuous twin of `gridworld/coverage.py`. The dial is the same outward-biased policy: with
-probability `1 - 1/D` take the action that most increases the distance from a moving anchor,
-otherwise act randomly and re-anchor. Distance is measured on the coarse cell graph (BFS between
-the cells the positions fall in), which is enough to steer by; the candidates for an outward
-move are the eight compass directions at full speed. D = 1 is a uniformly random walk in
-[-1, 1]^2; `uniform` draws state, action and goal independently over free space.
+probability `1 - 1/D` take the action that most increases the geodesic distance from a moving
+anchor, otherwise act randomly and re-anchor. The candidates for an outward move are the eight
+compass directions at full speed. Distance has to be the fine geodesic rather than the coarse
+cell BFS: a half-cell step that stays inside its cell makes no progress on the cell graph, so
+steering by cells reads every other step as stuck and re-anchors, and D stops mattering past 4.
+D = 1 is a uniformly random walk in [-1, 1]^2; `uniform` draws state, action and goal
+independently over free space.
 """
 
 import numpy as np
 
-from .world import cell_centre, cell_of, sample_positions, step_positions
+from .world import cell_centre, geodesic, sample_positions, step_positions
 
 COMPASS = np.array([(np.cos(t), np.sin(t)) for t in np.arange(8) * np.pi / 4], np.float32)
 COMPASS /= np.abs(COMPASS).max(1, keepdims=True)              # full speed along each axis
@@ -24,19 +26,21 @@ def collect_outward(W, start, D=1.0, n_traj=200, T=600, seed=0):
     P = np.zeros((n_traj, T + 1, 2), np.float32)
     A = np.zeros((n_traj, T, 2), np.float32)
     P[:, 0] = cell_centre(W, start)
-    anchor = np.full(n_traj, start)
+    anchor = np.repeat(P[:, 0][:, None, :], 8, 1)                # (n_traj, 8, 2), for geodesic
 
     for t in range(T):
         here = P[:, t]
-        here_cell = cell_of(W, here)
         # where each compass move would land, and how far from the anchor that is
         land = np.stack([step_positions(W, here, np.repeat(c[None], n_traj, 0)) for c in COMPASS], 1)
-        gain = W["cell_dist"][anchor[:, None], cell_of(W, land)] + rng.uniform(0, 1e-3, (n_traj, 8))
+        gain = geodesic(W, anchor, land) + rng.uniform(0, 1e-3, (n_traj, 8))
         go_out = rng.random(n_traj) < gamma
         A[:, t] = np.where(go_out[:, None], COMPASS[np.argmax(gain, 1)],
                            rng.uniform(-1, 1, (n_traj, 2)))
-        stuck = gain.max(1) <= W["cell_dist"][anchor, here_cell] + 1e-3
-        anchor = np.where(go_out & ~stuck, anchor, here_cell)
+        # A random step restarts the excursion; so does running out of room (a dead end, or the
+        # far wall), else a long excursion ping-pongs there.
+        stuck = gain.max(1) <= geodesic(W, anchor[:, 0], here) + 1e-3
+        keep = go_out & ~stuck
+        anchor = np.where(keep[:, None, None], anchor, np.repeat(here[:, None, :], 8, 1))
         P[:, t + 1] = step_positions(W, here, A[:, t])
     return P, A
 

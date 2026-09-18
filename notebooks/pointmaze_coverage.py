@@ -169,14 +169,15 @@ def _(W, mo):
 def _(C, P, W, grid_figure, heatmap, horizon, mo, n_traj, np, star, start):
     DS = [1, 4, 16, 64]
     LABELS = [f"D={d}" for d in DS] + ["uniform"]
-    H = W["n"] * W["sub"]
 
     def _visits(pos):
-        """Visits per fine-grid node, as an image."""
-        idx = np.clip((pos.reshape(-1, 2) * W["sub"]).astype(int), 0, H - 1)
-        img = np.zeros((H, H))
-        np.add.at(img, (idx[:, 0], idx[:, 1]), 1)
-        return np.where(W["fine"], img, np.nan)
+        """Visits per cell, as an image. Per cell rather than per fine-grid node: the outward
+        moves are half-cell compass steps from a cell centre, so positions sit on a lattice
+        that a finer histogram renders as a checkerboard."""
+        cell = np.clip(np.floor(pos.reshape(-1, 2)).astype(int), 0, W["n"] - 1)
+        img = np.zeros((W["n"], W["n"]))
+        np.add.at(img, (cell[:, 0], cell[:, 1]), 1)
+        return np.where(W["walls"], np.nan, img)
 
     # The walks, collected now; they are relabeled into batches only when training starts.
     # `uniform` does not walk: each state is an independent uniform draw over free space.
@@ -199,10 +200,11 @@ def _(C, P, W, grid_figure, heatmap, horizon, mo, n_traj, np, star, start):
     _sr, _sc = W["free_cells"][start.value]
     mo.vstack([
         mo.hstack([start, n_traj, horizon], justify="start", gap=1),
-        mo.md(f"Visits per fine-grid node. {n_traj.value} walks of {horizon.value} steps, every "
-              f"one starting at the centre of cell {start.value} = row {_sr}, col {_sc} (the "
-              f"star). D is the mean length of an outward excursion; D=1 is a uniformly random "
-              f"walk in [-1, 1]^2."),
+        mo.md(f"Visits per cell. {n_traj.value} walks of {horizon.value} steps, every one "
+              f"starting at the centre of cell {start.value} = row {_sr}, col {_sc} (the star). "
+              f"D is the mean length of an outward excursion in steps; D=1 is a uniformly random "
+              f"walk in [-1, 1]^2. Past D=16 an excursion already reaches the far end of the "
+              f"world, so D=64 looks like D=16."),
         _fig,
     ])
     return DS, LABELS, data
