@@ -2,8 +2,9 @@
 much is the data, when the state is a position and the action a displacement.
 
 Same design as `coverage_study.py`. Every critic is trained on relabeled trajectories from a
-persistent random walk whose mean run length D is the dial (D = 1 turns every step and
-diffuses; `uniform` draws state, action and goal independently), and scored against the geodesic
+persistent random walk that refuses the way back to the start when it turns, with mean run
+length D as the dial (D = 1 turns every step and diffuses; `uniform` draws state, action and
+goal independently), and scored against the geodesic
 distance around the walls: a greedy action counts as a good pick when it makes at least half
 the progress toward the goal that the best of the candidate actions would have made.
 
@@ -202,7 +203,7 @@ def _(C, P, W, grid_figure, heatmap, horizon, mo, n_traj, np, star, start):
         mo.hstack([start, n_traj, horizon], justify="start", gap=1),
         mo.md(f"Visits per cell. {n_traj.value} walks of {horizon.value} steps, every one "
               f"starting at the centre of cell {start.value} = row {_sr}, col {_sc} (the star). "
-              f"D is the mean run length of a persistent random walk, in steps; D=1 is a "
+              f"D is the mean run length of a persistent random walk that refuses the way home, in steps; D=1 is a "
               f"walk that turns every step. Past D=16 a run already reaches the far end of the "
               f"world, so D=64 looks like D=16."),
         _fig,
