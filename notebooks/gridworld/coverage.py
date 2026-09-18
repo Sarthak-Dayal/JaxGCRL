@@ -130,6 +130,9 @@ CRITICS = [
 ]
 
 
+_builders = {}
+
+
 def train_suite(W, h, batches, td_batches=None, seed=0, kind="sac", shaping=0.0, lr=3e-4,
                 width=128, repr_dim=32):
     """Train every critic in CRITICS on one dataset.
@@ -156,9 +159,14 @@ def train_suite(W, h, batches, td_batches=None, seed=0, kind="sac", shaping=0.0,
         # A distance energy cannot represent a positive target, so the regression and TD critics
         # take `dot` while the contrastive ones keep `norm`, as JaxGCRL does.
         energy = "norm" if objective in ("infonce", "bwd_infonce", "sym_infonce", "binary_nce") else "dot"
-        build = {"monolithic": lambda: monolithic(h, fd, width),
-                 "sa_g": lambda: sa_g_bilinear(h, fd, repr_dim, energy, width),
-                 "sg_a": lambda: sg_a_bilinear(h, fd, repr_dim, energy, width)}[factor]()
+        # one builder object per architecture, so the trainers' compiled loops are reused
+        # from dataset to dataset (they are cached on the builder's identity)
+        spec = (factor, h, fd, repr_dim, energy, width)
+        if spec not in _builders:
+            _builders[spec] = {"monolithic": lambda: monolithic(h, fd, width),
+                               "sa_g": lambda: sa_g_bilinear(h, fd, repr_dim, energy, width),
+                               "sg_a": lambda: sg_a_bilinear(h, fd, repr_dim, energy, width)}[factor]()
+        build = _builders[spec]
         if objective == "td":
             p, q, losses, accs = train_td(build, td_batches, W["feats"], chunks, kind, key,
                                           lr=lr)

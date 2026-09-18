@@ -34,7 +34,7 @@ Run it with:  uv run --with marimo --with plotly marimo edit notebooks/pointmaze
 
 import marimo
 
-__generated_with = "0.24.0"
+__generated_with = "0.24.2"
 app = marimo.App(width="medium")
 
 
@@ -67,8 +67,11 @@ def _(go, make_subplots, np):
         rows = -(-n_panels // cols)
         fig = make_subplots(rows=rows, cols=cols, subplot_titles=titles,
                             horizontal_spacing=0.1, vertical_spacing=0.12)
-        fig.update_layout(height=height * rows, margin=dict(l=10, r=10, t=50, b=10),
-                          plot_bgcolor="white", paper_bgcolor="white", showlegend=False)
+        # marimo switches plotly's default template to plotly_dark in its dark theme, which
+        # would put white text on these white panels; pin the template so it does not
+        fig.update_layout(template="plotly_white", height=height * rows,
+                          margin=dict(l=10, r=10, t=50, b=10), plot_bgcolor="white",
+                          paper_bgcolor="white", showlegend=False)
         fig.update_annotations(font_size=11)
         fig.update_xaxes(visible=False)
         fig.update_yaxes(visible=False, autorange="reversed")
@@ -328,7 +331,8 @@ def _(dataset, go, make_subplots, mo, np, runs):
                              secondary_y=False, row=r + 1, col=c + 1)
         fig.update_annotations(font_size=10)
         fig.update_layout(
-            height=560, margin=dict(l=40, r=20, t=70, b=30), hovermode="x",
+            template="plotly_white", height=560, margin=dict(l=40, r=20, t=70, b=30),
+            hovermode="x",
             title=dict(text=f"{dataset.value} data. Green = contrastive loss (red = its pair "
                             f"accuracy), blue = TD squared error, orange = regression squared "
                             f"error. Bold line is a {k}-step running mean.", font=dict(size=11)))
@@ -354,6 +358,9 @@ def _(P, W, arrows, grid_figure, heatmap, np, star):
               "makes at least half the progress of the best candidate, **magenta arrow** = it "
               "does not, **star** = goal.")
 
+    def _my_hover(img, label):
+        return np.where(np.isnan(img), "", np.char.add(f"{label} = ", np.round(img, 3).astype(str)))
+
     def critic_grid(entry, goal_cell, title):
         goal = P.cell_centre(W, goal_cell)
         pos = P.cell_grid(W)
@@ -363,7 +370,7 @@ def _(P, W, arrows, grid_figure, heatmap, np, star):
         geo_v = W["gamma"] ** (geo_img / W["step"])          # V* = gamma^(steps to go)
         for r, (objective, names) in enumerate(ROWS):
             panel = r * len(COLS)
-            rr, cc = heatmap(fig, panel, W, geo_v, _hover(geo_v, "V*"), colorscale="RdBu_r",
+            rr, cc = heatmap(fig, panel, W, geo_v, _my_hover(geo_v, "V*"), colorscale="RdBu_r",
                              zmin=float(np.nanmin(geo_v)), zmax=1.0, cols=len(COLS))
             arrows(fig, pos, P.ideal_field(W, goal), np.ones(len(pos), bool), rr, cc)
             star(fig, W, goal, rr, cc)
@@ -376,7 +383,7 @@ def _(P, W, arrows, grid_figure, heatmap, np, star):
                 e = entry["critics"][name]
                 v = P.value_grid(W, e, goal)
                 lo, hi = entry["vrange"][name]
-                rr, cc = heatmap(fig, panel, W, v, _hover(v, "V"), colorscale="RdBu_r",
+                rr, cc = heatmap(fig, panel, W, v, _my_hover(v, "V"), colorscale="RdBu_r",
                                  zmin=lo, zmax=hi, cols=len(COLS))
                 vec, good = P.action_field(W, e, goal)
                 arrows(fig, pos, vec, good, rr, cc)
@@ -389,9 +396,6 @@ def _(P, W, arrows, grid_figure, heatmap, np, star):
                                font=dict(size=12), xanchor="right")
         fig.update_layout(margin=dict(l=40, t=90), title=dict(text=title, font=dict(size=11)))
         return fig
-
-    def _hover(img, label):
-        return np.where(np.isnan(img), "", np.char.add(f"{label} = ", np.round(img, 3).astype(str)))
 
     return LEGEND, critic_grid
 
@@ -435,7 +439,8 @@ def _(C, DS, P, W, go, mo, n_cand, runs):
         fig.add_hline(y=floor, line=dict(color="grey", dash="dot", width=1),
                       annotation_text="random candidate", annotation_font_size=9)
         fig.update_layout(
-            height=420, margin=dict(l=40, r=20, t=60, b=40), hovermode="x unified",
+            template="plotly_white", height=420, margin=dict(l=40, r=20, t=60, b=40),
+            hovermode="x unified",
             title=dict(text="share of (position, goal) probes where the greedy action makes at "
                             "least half the best candidate's progress (dotted = the same critic "
                             "on uniform data)", font=dict(size=12)),
@@ -493,7 +498,8 @@ def _(C, WIDTHS, by_size, go, make_subplots, mo, scale_dataset, scale_train):
             fig.update_xaxes(type="log", row=r + 1, col=c + 1, tickfont=dict(size=8))
             fig.update_yaxes(range=[0, 1], row=r + 1, col=c + 1, tickfont=dict(size=8))
         fig.update_annotations(font_size=10)
-        fig.update_layout(height=480, margin=dict(l=40, r=20, t=70, b=40),
+        fig.update_layout(template="plotly_white", height=480,
+                          margin=dict(l=40, r=20, t=70, b=40),
                           title=dict(text=f"accuracy against parameter count, "
                                           f"{scale_dataset.value} data", font=dict(size=12)),
                           xaxis_title="parameters")
@@ -513,7 +519,15 @@ def _(W, WIDTHS, by_size, mo, np):
 
 
 @app.cell
-def _(LEGEND, by_size, critic_grid, mo, scale_dataset, scale_goal, scale_width):
+def _(
+    LEGEND,
+    by_size,
+    critic_grid,
+    mo,
+    scale_dataset,
+    scale_goal,
+    scale_width,
+):
     mo.vstack([
         mo.hstack([scale_dataset, scale_width, scale_goal], justify="start", gap=1),
         critic_grid(by_size[scale_width.value], int(scale_goal.value),

@@ -94,6 +94,9 @@ CRITICS = [
 ]
 
 
+_builders = {}
+
+
 def train_suite(W, h, batches, td_batches=None, cand=None, seed=0, kind="td3", lr=3e-4,
                 width=256, depth=2, repr_dim=64, lse=0.1, n_freq=16):
     """Train every critic in CRITICS on one dataset.
@@ -118,9 +121,16 @@ def train_suite(W, h, batches, td_batches=None, cand=None, seed=0, kind="td3", l
     for i, (name, factor, objective) in enumerate(CRITICS):
         key = jax.random.PRNGKey(seed + i)
         energy = "dot" if objective in ("td", "mse") else "norm"
-        build = {"monolithic": lambda: monolithic(h, scale, width, depth, n_freq),
-                 "sa_g": lambda: sa_g_bilinear(h, scale, repr_dim, energy, width, depth, n_freq),
-                 "sg_a": lambda: sg_a_bilinear(h, scale, repr_dim, energy, width, depth, n_freq)}[factor]()
+        # one builder object per architecture, so the trainers' compiled loops are reused
+        # from dataset to dataset (they are cached on the builder's identity)
+        spec = (factor, h, scale, repr_dim, energy, width, depth, n_freq)
+        if spec not in _builders:
+            _builders[spec] = {
+                "monolithic": lambda: monolithic(h, scale, width, depth, n_freq),
+                "sa_g": lambda: sa_g_bilinear(h, scale, repr_dim, energy, width, depth, n_freq),
+                "sg_a": lambda: sg_a_bilinear(h, scale, repr_dim, energy, width, depth, n_freq),
+            }[factor]()
+        build = _builders[spec]
         if objective == "td":
             p, q, losses, accs = train_td(build, td_batches, cand, kind, key, lr=lr)
         elif objective == "mse":

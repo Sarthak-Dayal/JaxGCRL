@@ -61,8 +61,11 @@ def _(G, go, make_subplots, np):
         rows = -(-n_panels // cols)
         fig = make_subplots(rows=rows, cols=cols, subplot_titles=titles,
                             horizontal_spacing=0.1, vertical_spacing=0.12)
-        fig.update_layout(height=height * rows, margin=dict(l=10, r=10, t=50, b=10),
-                          plot_bgcolor="white", paper_bgcolor="white", showlegend=False)
+        # marimo switches plotly's default template to plotly_dark in its dark theme, which
+        # would put white text on these white panels; pin the template so it does not
+        fig.update_layout(template="plotly_white", height=height * rows,
+                          margin=dict(l=10, r=10, t=50, b=10), plot_bgcolor="white",
+                          paper_bgcolor="white", showlegend=False)
         fig.update_annotations(font_size=11)
         fig.update_xaxes(visible=False)
         fig.update_yaxes(visible=False, autorange="reversed")           # row 0 at the top
@@ -318,7 +321,8 @@ def _(dataset, go, make_subplots, mo, np, runs):
                              secondary_y=False, row=r + 1, col=c + 1)
         fig.update_annotations(font_size=10)
         fig.update_layout(
-            height=560, margin=dict(l=40, r=20, t=70, b=30), hovermode="x",
+            template="plotly_white", height=560, margin=dict(l=40, r=20, t=70, b=30),
+            hovermode="x",
             title=dict(text=f"{dataset.value} data. Green = contrastive loss (red = its pair "
                             f"accuracy), blue = TD squared error, orange = regression squared "
                             f"error. Bold line is a {k}-step running mean.", font=dict(size=11)))
@@ -443,7 +447,8 @@ def _(C, DS, go, mo, runs):
                 line=dict(color=colour, dash="dot", width=1),
                 hovertemplate="uniform: %{y:.2f}<extra>" + name + "</extra>"))
         fig.update_layout(
-            height=420, margin=dict(l=40, r=20, t=60, b=40), hovermode="x unified",
+            template="plotly_white", height=420, margin=dict(l=40, r=20, t=60, b=40),
+            hovermode="x unified",
             title=dict(text="share of cells where the critic picks a BFS-optimal move "
                             "(dotted = the same critic trained on uniform data)",
                        font=dict(size=12)),
@@ -501,7 +506,8 @@ def _(C, WIDTHS, by_size, go, make_subplots, mo, scale_dataset, scale_train):
             fig.update_xaxes(type="log", row=r + 1, col=c + 1, tickfont=dict(size=8))
             fig.update_yaxes(range=[0, 1], row=r + 1, col=c + 1, tickfont=dict(size=8))
         fig.update_annotations(font_size=10)
-        fig.update_layout(height=480, margin=dict(l=40, r=20, t=70, b=40),
+        fig.update_layout(template="plotly_white", height=480,
+                          margin=dict(l=40, r=20, t=70, b=40),
                           title=dict(text=f"argmax accuracy against parameter count, "
                                           f"{scale_dataset.value} data", font=dict(size=12)),
                           xaxis_title="parameters")
