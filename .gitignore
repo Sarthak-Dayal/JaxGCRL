@@ -323,3 +323,9 @@ notebooks/figures/
 # nix build output
 result
 result-*
+
+# direnv
+.direnv/
+
+# marimo session cache
+notebooks/__marimo__/
