@@ -1,47 +1,47 @@
 """Data distributions of controllable coverage in the continuous maze, from random to full.
 
-The continuous twin of `gridworld/coverage.py`. The dial is the same outward-biased policy: with
-probability `1 - 1/D` take the action that most increases the geodesic distance from a moving
-anchor, otherwise act randomly and re-anchor. The candidates for an outward move are the eight
-compass directions at full speed. Distance has to be the fine geodesic rather than the coarse
-cell BFS: a half-cell step that stays inside its cell makes no progress on the cell graph, so
-steering by cells reads every other step as stuck and re-anchors, and D stops mattering past 4.
-D = 1 is a uniformly random walk in [-1, 1]^2; `uniform` draws state, action and goal
-independently over free space.
+The continuous twin of `gridworld/coverage.py`. The dial is the persistence of a random walk.
+The walker carries a heading; each step it moves along it at a random speed, the heading
+drifts a little, and with probability `1 / D` -- or on hitting a wall -- it is re-drawn
+uniformly. Runs are therefore geometric with mean D steps: D = 1 is a walk that turns every
+step and diffuses, large D is nearly ballistic and crosses the world. Nothing here looks at the
+map, unlike the gridworld's collector, which steers by BFS distance from an anchor; in
+continuous space a heading is the natural thing to persist, and it makes paths curves rather
+than staircases. The speed is random so that the actions in the data fill the action box the
+critics are later maximized over: at full speed only, every action sits on the box's boundary,
+a critic's action tower never sees the interior, and its argmax lands on extrapolated
+interior actions that barely move. `uniform` draws state, action and goal independently over
+free space.
 """
 
 import numpy as np
 
-from .world import cell_centre, geodesic, sample_positions, step_positions
-
-COMPASS = np.array([(np.cos(t), np.sin(t)) for t in np.arange(8) * np.pi / 4], np.float32)
-COMPASS /= np.abs(COMPASS).max(1, keepdims=True)              # full speed along each axis
+from .world import cell_centre, sample_positions, step_positions
 
 
-def collect_outward(W, start, D=1.0, n_traj=200, T=600, seed=0):
-    """Random walks biased outward from a moving anchor, every one beginning at the centre of
-    cell `start`. See `gridworld.coverage.collect_outward` for why the anchor moves."""
-    gamma = 0.0 if D <= 1 else 1.0 - 1.0 / D
+def collect_outward(W, start, D=1.0, n_traj=200, T=600, seed=0, drift=0.25, min_speed=0.25):
+    """Persistent random walks of mean run length D, every one beginning at the centre of cell
+    `start`. `drift` is the per-step heading jitter in radians; speed is uniform on
+    [min_speed, 1] of full speed."""
     rng = np.random.default_rng(seed)
     P = np.zeros((n_traj, T + 1, 2), np.float32)
     A = np.zeros((n_traj, T, 2), np.float32)
     P[:, 0] = cell_centre(W, start)
-    anchor = np.repeat(P[:, 0][:, None, :], 8, 1)                # (n_traj, 8, 2), for geodesic
+    heading = rng.uniform(0, 2 * np.pi, n_traj)
 
     for t in range(T):
         here = P[:, t]
-        # where each compass move would land, and how far from the anchor that is
-        land = np.stack([step_positions(W, here, np.repeat(c[None], n_traj, 0)) for c in COMPASS], 1)
-        gain = geodesic(W, anchor, land) + rng.uniform(0, 1e-3, (n_traj, 8))
-        go_out = rng.random(n_traj) < gamma
-        A[:, t] = np.where(go_out[:, None], COMPASS[np.argmax(gain, 1)],
-                           rng.uniform(-1, 1, (n_traj, 2)))
-        # A random step restarts the excursion; so does running out of room (a dead end, or the
-        # far wall), else a long excursion ping-pongs there.
-        stuck = gain.max(1) <= geodesic(W, anchor[:, 0], here) + 1e-3
-        keep = go_out & ~stuck
-        anchor = np.where(keep[:, None, None], anchor, np.repeat(here[:, None, :], 8, 1))
-        P[:, t + 1] = step_positions(W, here, A[:, t])
+        # along the heading, at a speed of `min_speed`..1 of full (full = the larger component
+        # saturates the action box)
+        act = np.stack([np.cos(heading), np.sin(heading)], -1)
+        act = act / np.abs(act).max(1, keepdims=True) * rng.uniform(min_speed, 1, (n_traj, 1))
+        A[:, t] = act
+        P[:, t + 1] = step_positions(W, here, act)
+        # a wall (the move came up short) or a random turn ends the run
+        blocked = np.linalg.norm(P[:, t + 1] - here, axis=-1) < 0.9 * W["step"] * np.abs(act).max(1)
+        turn = blocked | (rng.random(n_traj) < 1.0 / D)
+        heading = np.where(turn, rng.uniform(0, 2 * np.pi, n_traj),
+                           heading + rng.normal(0, drift, n_traj))
     return P, A
 
 
