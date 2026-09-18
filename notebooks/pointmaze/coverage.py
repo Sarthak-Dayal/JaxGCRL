@@ -1,16 +1,18 @@
 """Data distributions of controllable coverage in the continuous maze, from random to full.
 
-The continuous twin of `gridworld/coverage.py`. The walker carries a heading and moves along it
-at a random speed; the heading drifts a little each step and is re-drawn with probability
-`1 / D`, or on hitting a wall. Every point knows the direction that leads back toward the start
-(the geodesic descent toward it), and with probability `1 - 1/D` a voluntary turn takes its new
-heading from the half-plane facing *away* from that direction. So D = 1 is a plain random walk
-that turns every step, and large D is long runs that, when they do turn, keep heading out.
-Nothing is steered toward anything; the walk only refuses the way home. A turn forced by a wall
-is unconstrained: refusing the way home at a dead end means vibrating in it until the trajectory
-ends, and a stalled tail relabels goals on top of their states. The speed is random so that the actions in the
-data fill the box the critics are later maximized over: at full speed only, every action sits
-on the box's boundary, a critic's action tower never sees the interior, and its argmax lands on
+The continuous twin of `gridworld/coverage.py`, with a different dial. What sets the distance
+between a state and its relabeled goal is how far the walk travels within the relabeling
+horizon (a few dozen steps), and in a maze no local rule -- persistence, refusing the way back
+to the start -- gets far in that time: corridors end, runs end at walls, and the walk is back to
+diffusing. Coverage at every distance needs trajectories that go somewhere. So the walker
+navigates: it picks a uniformly random waypoint, follows the geodesic toward it, and picks
+another on arrival -- the way the D4RL antmaze datasets were collected. With probability `1/D`
+a step is random instead, so D = 1 is a uniformly random walk, D = 4 a navigator that wanders a
+quarter of the time, and large D a competent one whose futures are as far away as the horizon
+allows. The waypoints are the walker's own and hidden from the critics, which see only
+(state, action, relabeled goal). The speed is random so that the actions in the data fill the
+box the critics are later maximized over: at full speed only, every action sits on the box's
+boundary, a critic's action tower never sees the interior, and its argmax lands on
 extrapolated interior actions that barely move. `uniform` draws state, action and goal
 independently over free space.
 """
@@ -20,35 +22,31 @@ import numpy as np
 from .world import cell_centre, descent_direction, sample_positions, step_positions
 
 
-def collect_outward(W, start, D=1.0, n_traj=200, T=600, seed=0, drift=0.25, min_speed=0.25):
-    """Outward-biased persistent random walks, every one beginning at the centre of cell
-    `start`. `drift` is the per-step heading jitter in radians; speed is uniform on
-    [min_speed, 1] of full speed."""
+def collect_outward(W, start, D=1.0, n_traj=200, T=600, seed=0, jitter=0.35, min_speed=0.25):
+    """Noisy waypoint navigation, every walk beginning at the centre of cell `start`. `jitter`
+    is the heading noise (radians) on a navigating step; speed is uniform on [min_speed, 1]
+    of full speed."""
     rng = np.random.default_rng(seed)
     P = np.zeros((n_traj, T + 1, 2), np.float32)
     A = np.zeros((n_traj, T, 2), np.float32)
     P[:, 0] = cell_centre(W, start)
-    home_pos = P[:, 0].copy()
-    heading = rng.uniform(0, 2 * np.pi, n_traj)
-    outward = 0.0 if D <= 1 else 1.0 - 1.0 / D
+    waypoint = sample_positions(W, n_traj, rng)
+    navigate = 0.0 if D <= 1 else 1.0 - 1.0 / D
 
     for t in range(T):
         here = P[:, t]
+        toward = descent_direction(W, here, waypoint)
+        heading = np.where(rng.random(n_traj) < navigate,
+                           np.arctan2(toward[:, 1], toward[:, 0]) + rng.normal(0, jitter, n_traj),
+                           rng.uniform(0, 2 * np.pi, n_traj))
         # along the heading, at a speed of `min_speed`..1 of full (full = the larger component
         # saturates the action box)
         act = np.stack([np.cos(heading), np.sin(heading)], -1)
         act = act / np.abs(act).max(1, keepdims=True) * rng.uniform(min_speed, 1, (n_traj, 1))
         A[:, t] = act
         P[:, t + 1] = step_positions(W, here, act)
-        # a wall (the move came up short) or a random turn ends the run. A voluntary turn
-        # refuses the way home with probability `outward`; a forced one is unconstrained.
-        blocked = np.linalg.norm(P[:, t + 1] - here, axis=-1) < 0.9 * W["step"] * np.abs(act).max(1)
-        voluntary = rng.random(n_traj) < 1.0 / D
-        home = descent_direction(W, P[:, t + 1], home_pos)
-        away = np.arctan2(home[:, 1], home[:, 0]) + np.pi + rng.uniform(-np.pi / 2, np.pi / 2, n_traj)
-        uniform = rng.uniform(0, 2 * np.pi, n_traj)
-        fresh = np.where(voluntary & ~blocked & (rng.random(n_traj) < outward), away, uniform)
-        heading = np.where(blocked | voluntary, fresh, heading + rng.normal(0, drift, n_traj))
+        arrived = np.linalg.norm(P[:, t + 1] - waypoint, axis=-1) < W["goal_radius"]
+        waypoint = np.where(arrived[:, None], sample_positions(W, n_traj, rng), waypoint)
     return P, A
 
 
