@@ -227,7 +227,10 @@ def _(mo):
                          show_value=True)
     lr = mo.ui.dropdown(options={"3e-4": 3e-4, "1e-3": 1e-3, "3e-3": 3e-3}, value="1e-3",
                         label="learning rate")
-    n_cand = mo.ui.dropdown(options={"64": 64, "256": 256}, value="64", label="candidate actions")
+    # 32 candidates for the sampled max scores the same as 64 or 256 and halves the TD critics'
+    # cost, which is the max over candidates at every step
+    n_cand = mo.ui.dropdown(options={"32": 32, "64": 64, "256": 256}, value="32",
+                            label="candidate actions")
     train = mo.ui.run_button(label="train 10 critics on every dataset")
     return lr, n_cand, steps, train
 
@@ -244,35 +247,35 @@ def _(C, P, W, data, lr, n_cand, np, steps):
         return (P.make_batches(W, Pp, A, 1, steps.value),
                 P.make_batches(W, Pp, A, 1, steps.value, future="uniform"))
 
-    def train_and_score(label, **kw):
-        """Every critic on one dataset, evaluated, plus a fixed colour range per critic taken
-        over several goals (autoscaling would hide a critic that ignores the goal)."""
-        b, b_td = relabel(label)
+    def train_and_score(labels, bar=None, **kw):
+        """Every critic on every dataset in `labels`, trained together (one vmapped call per
+        critic, which on this GPU costs little more than one dataset) and evaluated per dataset.
+        Returns {label: entry}; an entry's colour range per critic is filled in when a grid is
+        first drawn (see `critic_grid`) rather than for every critic up front."""
+        pairs = [relabel(l) for l in labels]
         trained = {}
-        for _, out in C.train_suite(W, 1, b, b_td, cand=P.candidates(1, n_cand.value),
-                                    lr=lr.value, kind="td3", **kw):
+        for _, out in C.train_suite(W, 1, [b for b, _ in pairs], [bt for _, bt in pairs],
+                                    cand=P.candidates(1, n_cand.value), lr=lr.value, kind="td3",
+                                    **{"width": 128, "repr_dim": 32, **kw}):
             trained = out
-        probe_goals = P.sample_positions(W, 5, np.random.default_rng(3))
-        vrange = {}
-        for k, v in trained.items():
-            maps = np.concatenate([P.value_grid(W, v, g).ravel() for g in probe_goals])
-            vrange[k] = (float(np.nanmin(maps)), float(np.nanmax(maps)))
-        return dict(critics=trained,
-                    scores={k: P.evaluate(W, v, n_eval=150, n_probe=300)
-                            for k, v in trained.items()},
-                    vrange=vrange)
+            if bar is not None:
+                bar.update()
+        return {label: dict(critics={k: v[j] for k, v in trained.items()},
+                            scores={k: P.evaluate(W, v[j], n_eval=150, n_probe=300)
+                                    for k, v in trained.items()},
+                            vrange={})
+                for j, label in enumerate(labels)}
 
     return (train_and_score,)
 
 
 @app.cell
-def _(LABELS, lr, mo, n_cand, steps, train, train_and_score):
+def _(C, LABELS, lr, mo, n_cand, steps, train, train_and_score):
     runs = {}
     if train.value:
-        with mo.status.progress_bar(total=len(LABELS), title="training every dataset") as _bar:
-            for _label in LABELS:
-                runs[_label] = train_and_score(_label)
-                _bar.update()
+        with mo.status.progress_bar(total=len(C.CRITICS), title="training every critic on every "
+                                                                 "dataset") as _bar:
+            runs = train_and_score(LABELS, _bar)
 
     mo.vstack([
         mo.hstack([steps, lr, n_cand, train], justify="start", gap=1),
@@ -280,7 +283,8 @@ def _(LABELS, lr, mo, n_cand, steps, train, train_and_score):
               f"nothing retrains." if runs else
               f"Each dataset is relabeled into {steps.value} batches of 256 and every critic "
               f"takes one step per batch. The max over actions is over {n_cand.value} fixed "
-              f"candidates. {len(LABELS)} datasets x 10 critics is a few minutes on the GPU."),
+              f"candidates. All {len(LABELS)} datasets train together, about a minute on the "
+              f"GPU the first time (XLA compiles) and half that after."),
     ])
     return (runs,)
 
@@ -367,6 +371,19 @@ def _(P, W, arrows, grid_figure, heatmap, np, star):
     def _my_hover(img, label):
         return np.where(np.isnan(img), "", np.char.add(f"{label} = ", np.round(img, 3).astype(str)))
 
+    PROBE_GOALS = P.sample_positions(W, 3, np.random.default_rng(3))
+
+    def vrange(entry, name):
+        """A fixed colour range per critic, taken over several goals and cached on the entry.
+        Autoscaling each panel to its own min/max would render a map that merely shifts with
+        the goal as *identical* pictures, which is exactly what a critic that barely conditions
+        on the goal produces -- the failure would be invisible."""
+        if name not in entry["vrange"]:
+            maps = np.concatenate([P.value_grid(W, entry["critics"][name], g).ravel()
+                                   for g in PROBE_GOALS])
+            entry["vrange"][name] = (float(np.nanmin(maps)), float(np.nanmax(maps)))
+        return entry["vrange"][name]
+
     def critic_grid(entry, goal_cell, title):
         goal = P.cell_centre(W, goal_cell)
         pos = P.cell_grid(W)
@@ -388,7 +405,7 @@ def _(P, W, arrows, grid_figure, heatmap, np, star):
                     continue
                 e = entry["critics"][name]
                 v = P.value_grid(W, e, goal)
-                lo, hi = entry["vrange"][name]
+                lo, hi = vrange(entry, name)
                 rr, cc = heatmap(fig, panel, W, v, _my_hover(v, "V"), colorscale="RdBu_r",
                                  zmin=lo, zmax=hi, cols=len(COLS))
                 vec, good = P.action_field(W, e, goal)
@@ -461,7 +478,7 @@ def _(C, DS, P, W, go, mo, n_cand, runs):
 @app.cell
 def _(LABELS, mo):
     # The same critics at five network sizes, on one dataset. Width is every MLP's hidden width;
-    # the two-tower embedding scales with it (width / 4, so 256 -> 64, today's default).
+    # the two-tower embedding scales with it (width / 4, so 128 -> 32, today's default).
     WIDTHS = [32, 64, 128, 256, 512]
     scale_dataset = mo.ui.dropdown(options=LABELS, value=LABELS[1], label="dataset")
     scale_train = mo.ui.run_button(label="train 10 critics at 5 sizes")
@@ -474,7 +491,8 @@ def _(WIDTHS, mo, scale_dataset, scale_train, train_and_score):
     if scale_train.value:
         with mo.status.progress_bar(total=len(WIDTHS), title="training every size") as _bar:
             for _w in WIDTHS:
-                by_size[_w] = train_and_score(scale_dataset.value, width=_w, repr_dim=_w // 4)
+                by_size[_w] = train_and_score([scale_dataset.value], width=_w,
+                                              repr_dim=_w // 4)[scale_dataset.value]
                 _bar.update()
     return (by_size,)
 
@@ -518,7 +536,7 @@ def _(C, WIDTHS, by_size, go, make_subplots, mo, scale_dataset, scale_train):
 @app.cell
 def _(W, WIDTHS, by_size, mo, np):
     mo.stop(not by_size, mo.md(""))
-    scale_width = mo.ui.dropdown(options={str(w): w for w in WIDTHS}, value="256", label="width")
+    scale_width = mo.ui.dropdown(options={str(w): w for w in WIDTHS}, value="128", label="width")
     scale_goal = mo.ui.slider(0, W["N"] - 1, value=int(np.argmax(W["cell_dist"][:, 0])),
                               label="goal cell", show_value=True)
     return scale_goal, scale_width

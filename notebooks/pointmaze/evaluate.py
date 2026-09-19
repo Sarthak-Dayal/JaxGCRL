@@ -8,21 +8,27 @@ from .world import descent_direction, geodesic, sample_positions, step_positions
 
 GOOD_FRACTION = 0.5     # a pick counts as correct when it makes at least this share of the
                         # best progress any candidate would have made
+DEVICE = None           # where evaluation runs (None = JAX's default device); see `_cpu`
+
+
+_bundles = {}
 
 
 def _cpu(W, e):
-    """The critic's evaluation-side functions, jitted on the CPU and cached on the critic.
-
-    Evaluation is hundreds of calls on a few hundred positions each: on a GPU that is
-    kernel-launch overhead and nothing else. Compiled once per critic (and per input shape),
-    with a CPU copy of the parameters. The greedy rollout is a single scan, with the point-mass
-    dynamics (wall sliding included) written in jnp to match `world.step_positions`.
-    """
-    if "_cpu" not in e:
-        cpu = jax.devices("cpu")[0]
-        C, params = jax.device_put(e["cand"], cpu), jax.device_put(e["params"], cpu)
-        walls = jax.device_put(W["walls"], cpu)
+    """The critic's evaluation-side functions, jitted once per *architecture* and shared by every
+    critic built from it -- the parameters are an argument, not part of the closure, so ten
+    critics of one shape cost one compile. The greedy rollout is a single scan, with the
+    point-mass dynamics (wall sliding included) written in jnp to match `world.step_positions`.
+    `DEVICE` picks where this runs: each call is one launch of a large scan, which the GPU does
+    in a fraction of the CPU's time (unlike the gridworld's many tiny calls)."""
+    dev = jax.devices(DEVICE)[0] if DEVICE else jax.devices()[0]
+    key = (id(e["q"]), id(W), np.shape(e["cand"]), str(dev))
+    hit = _bundles.get(key)
+    if hit is None or hit[0] is not e["q"]:
+        C = jax.device_put(e["cand"], dev)
+        walls = jax.device_put(W["walls"], dev)
         n, step, radius = W["n"], W["step"], W["goal_radius"]
+        q = e["q"]
 
         def free(pos):
             cell = jnp.floor(pos).astype(jnp.int32)
@@ -40,33 +46,35 @@ def _cpu(W, e):
                 out = jnp.where(take[..., None], cand, out)
             return out
 
-        def q_all(pos, goal):
+        def q_all(params, pos, goal):
             """(len(pos), n_cand): the critic at every candidate chunk."""
             s = jnp.repeat(pos[:, None, :], C.shape[0], 1)
             g = jnp.repeat(goal[:, None, :], C.shape[0], 1)
-            qs = e["q"](params, s, g, jnp.broadcast_to(C, (pos.shape[0],) + C.shape))
+            qs = q(params, s, g, jnp.broadcast_to(C, (pos.shape[0],) + C.shape))
             return jnp.min(qs, -1) if qs.shape[-1] == 2 else qs[..., 0]
 
-        def greedy(pos, goal):
+        def greedy(params, pos, goal):
             """Execute only the first action of the best chunk, then replan."""
-            return C[jnp.argmax(q_all(pos, goal), -1), :2]
+            return C[jnp.argmax(q_all(params, pos, goal), -1), :2]
 
-        def rollout(pos, goal, budget):
+        def rollout(params, pos, goal, budget):
             def body(carry, _):
-                pos, alive, visits = carry
-                visits = visits + alive[:, None]
-                pos = jnp.where(alive[:, None], move(pos, greedy(pos, goal)), pos)
+                pos, alive = carry
+                pos = jnp.where(alive[:, None], move(pos, greedy(params, pos, goal)), pos)
                 alive = alive & (jnp.linalg.norm(pos - goal, axis=-1) >= radius)
-                return (pos, alive, visits), pos
+                return (pos, alive), pos
 
             alive = jnp.linalg.norm(pos - goal, axis=-1) >= radius
-            (pos, alive, _), path = jax.lax.scan(body, (pos, alive, jnp.zeros((len(pos), 1))),
-                                                 None, length=budget)
+            (pos, alive), path = jax.lax.scan(body, (pos, alive), None, length=budget)
             return ~alive, path
 
-        e["_cpu"] = dict(q_all=jax.jit(q_all), greedy=jax.jit(greedy),
-                         rollout=jax.jit(rollout, static_argnames="budget"), device=cpu)
-    return e["_cpu"]
+        hit = _bundles[key] = (e["q"], dict(q_all=jax.jit(q_all), greedy=jax.jit(greedy),
+                                             rollout=jax.jit(rollout, static_argnames="budget"),
+                                             device=dev))
+    f = hit[1]
+    if e.get("_dev") is not dev:
+        e["_params"], e["_dev"] = jax.device_put(e["params"], dev), dev
+    return f
 
 
 def _to(f, *xs):
@@ -75,18 +83,18 @@ def _to(f, *xs):
 
 def q_over_candidates(W, e, pos, goal):
     f = _cpu(W, e)
-    return np.asarray(f["q_all"](*_to(f, pos, goal)))
+    return np.asarray(f["q_all"](e["_params"], *_to(f, pos, goal)))
 
 
 def greedy_action(W, e, pos, goal):
     f = _cpu(W, e)
-    return np.asarray(f["greedy"](*_to(f, pos, goal)))
+    return np.asarray(f["greedy"](e["_params"], *_to(f, pos, goal)))
 
 
 def rollouts(W, e, pos, goal, budget):
     """Greedy rollouts from `pos` to `goal`: (arrived mask, positions over time)."""
     f = _cpu(W, e)
-    arrived, path = f["rollout"](*_to(f, pos, goal), budget)
+    arrived, path = f["rollout"](e["_params"], *_to(f, pos, goal), budget)
     return np.asarray(arrived), np.asarray(path)
 
 

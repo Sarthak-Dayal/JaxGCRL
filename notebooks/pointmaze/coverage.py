@@ -99,14 +99,19 @@ _builders = {}
 
 def train_suite(W, h, batches, td_batches=None, cand=None, seed=0, kind="td3", lr=3e-4,
                 width=256, depth=2, repr_dim=64, lse=0.1, n_freq=16):
-    """Train every critic in CRITICS on one dataset.
+    """Train every critic in CRITICS on one dataset, or on several at once.
 
     `batches` (geometric hindsight goals) trains the contrastive critics; `td_batches` (uniform
-    hindsight goals) trains TD and the regression control, defaulting to `batches`. `cand` is
-    the candidate pool the sampled max runs over. `width`, `depth` and `repr_dim` size every
-    network; `lse` is the contrastive logsumexp penalty.
+    hindsight goals) trains TD and the regression control, defaulting to `batches`. Either may
+    be a list of batch dicts, one per dataset: they are stacked and every critic trains on all
+    of them in one vmapped call, which on a launch-bound GPU costs about what one dataset does.
+    Yields `(name, out)` where `out[name]` is the critic (a list of critics, one per dataset,
+    when lists were given). `cand` is the candidate pool the sampled max runs over. `width`,
+    `depth` and `repr_dim` size every network, `n_freq` is the position encoding's number of
+    frequencies (0 for raw coordinates); `lse` is the contrastive logsumexp penalty.
     """
     import jax
+    import jax.numpy as jnp
 
     from .critics import monolithic, sa_g_bilinear, sg_a_bilinear
     from .data import add_optimal_targets
@@ -114,12 +119,23 @@ def train_suite(W, h, batches, td_batches=None, cand=None, seed=0, kind="td3", l
 
     if cand is None:
         cand = candidates(h, 64)
-    td_batches = add_optimal_targets(W, batches if td_batches is None else td_batches)
+    stacked = isinstance(batches, list)
+    if td_batches is None:
+        td_batches = batches
+    if stacked:
+        stack = lambda bs: jax.tree_util.tree_map(lambda *x: np.stack(x), *bs)
+        td_batches = stack([add_optimal_targets(W, b) for b in td_batches])
+        batches = stack(batches)
+        n_ds = len(jax.tree_util.tree_leaves(batches)[0])
+    else:
+        td_batches = add_optimal_targets(W, td_batches)
+        n_ds = 1
     scale = 1.0 / W["n"]
 
     out = {}
     for i, (name, factor, objective) in enumerate(CRITICS):
-        key = jax.random.PRNGKey(seed + i)
+        key = jax.random.split(jax.random.PRNGKey(seed + i), n_ds) if stacked \
+            else jax.random.PRNGKey(seed + i)
         energy = "dot" if objective in ("td", "mse") else "norm"
         # one builder object per architecture, so the trainers' compiled loops are reused
         # from dataset to dataset (they are cached on the builder's identity)
@@ -132,12 +148,18 @@ def train_suite(W, h, batches, td_batches=None, cand=None, seed=0, kind="td3", l
             }[factor]()
         build = _builders[spec]
         if objective == "td":
-            p, q, losses, accs = train_td(build, td_batches, cand, kind, key, lr=lr)
+            p, q, losses, accs = train_td(build, td_batches, cand, kind, key, lr=lr, stacked=stacked)
         elif objective == "mse":
-            p, q, losses, accs = train_regression(build, td_batches, key, lr=lr)
+            p, q, losses, accs = train_regression(build, td_batches, key, lr=lr, stacked=stacked)
         else:
             p, q, losses, accs = train_contrastive(build, batches, key, lr=lr, loss_fn=objective,
-                                                   logsumexp_coeff=lse)
-        out[name] = dict(params=p, q=q, cand=cand, losses=losses, accs=accs, objective=objective,
-                         n_params=sum(x.size for x in jax.tree_util.tree_leaves(p)))
+                                                   logsumexp_coeff=lse, stacked=stacked)
+        n_params = sum(x.size for x in jax.tree_util.tree_leaves(p)) // n_ds
+        if stacked:
+            out[name] = [dict(params=jax.tree_util.tree_map(lambda x, j=j: x[j], p), q=q, cand=cand,
+                              losses=losses[j], accs=accs[j] if accs else [], objective=objective,
+                              n_params=n_params) for j in range(n_ds)]
+        else:
+            out[name] = dict(params=p, q=q, cand=cand, losses=losses, accs=accs, objective=objective,
+                             n_params=n_params)
         yield name, out

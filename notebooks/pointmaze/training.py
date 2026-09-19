@@ -11,7 +11,9 @@ for truth.
 
 The compiled loop is cached per (critic builder, objective, hyperparameters): a sweep trains the
 same architecture on dataset after dataset, and without the cache every one of those is a fresh
-XLA compile that costs more than the training it does.
+XLA compile that costs more than the training it does. With `stacked=True` the batches carry a
+leading dataset axis and the loop is vmapped over it: the networks are small enough that the
+GPU is launch-bound, so five datasets cost about what one does.
 """
 
 import jax
@@ -31,16 +33,20 @@ def candidates(h, n_cand, seed=0):
 _compiled = {}
 
 
-def _cached(key, build, make):
-    """The jitted training loop for `build` under `key`, compiled once. The builder object is
-    kept alongside so a recycled id() cannot hand back another architecture's loop."""
+def _cached(key, build, make, stacked, in_axes):
+    """The jitted training loop for `build` under `key`, compiled once; vmapped over a leading
+    dataset axis when `stacked`. The builder object is kept alongside so a recycled id() cannot
+    hand back another architecture's loop."""
+    key = key + (stacked,)
     hit = _compiled.get(key)
     if hit is None or hit[0] is not build:
-        hit = _compiled[key] = (build, *make())
+        run, q = make()
+        run = jax.jit(jax.vmap(run, in_axes=in_axes) if stacked else run)
+        hit = _compiled[key] = (build, run, q)
     return hit[1:]
 
 
-def train_td(build, batches, cand, kind, key, alpha=0.05, tau=0.01, lr=3e-4):
+def train_td(build, batches, cand, kind, key, alpha=0.05, tau=0.01, lr=3e-4, stacked=False):
     def make():
         # Both use clipped double-Q: SAC takes the min over twin critics in its target just as
         # TD3 does. With a single head the sampled max overestimates and the critic diverges --
@@ -63,7 +69,6 @@ def train_td(build, batches, cand, kind, key, alpha=0.05, tau=0.01, lr=3e-4):
                 return alpha * (jax.nn.logsumexp(qs / alpha, -1) - jnp.log(qs.shape[-1]))
             return jnp.max(qs, -1)
 
-        @jax.jit
         def run(key, batches, C):
             params = target = init(key)
             opt_state = opt.init(params)
@@ -87,12 +92,13 @@ def train_td(build, batches, cand, kind, key, alpha=0.05, tau=0.01, lr=3e-4):
 
         return run, q
 
-    run, q = _cached(("td", id(build), kind, alpha, tau, lr), build, make)
+    run, q = _cached(("td", id(build), kind, alpha, tau, lr), build, make, stacked, (0, 0, None))
     params, losses = run(key, jax.device_put(batches), jnp.asarray(cand))
     return params, q, losses.tolist(), []
 
 
-def train_contrastive(build, batches, key, lr=3e-4, logsumexp_coeff=0.1, loss_fn="infonce"):
+def train_contrastive(build, batches, key, lr=3e-4, logsumexp_coeff=0.1, loss_fn="infonce",
+                      stacked=False):
     """Contrastive fitting over the batch: forward InfoNCE (rows normalized over the right
     tower's entries), backward (columns, over the left tower's), symmetric, or per-pair binary
     NCE. The logsumexp penalty is the repo's."""
@@ -100,7 +106,6 @@ def train_contrastive(build, batches, key, lr=3e-4, logsumexp_coeff=0.1, loss_fn
         init, q, logits = build(1)
         opt = optax.adam(lr)
 
-        @jax.jit
         def run(key, batches):
             params = init(key)
             opt_state = opt.init(params)
@@ -132,19 +137,19 @@ def train_contrastive(build, batches, key, lr=3e-4, logsumexp_coeff=0.1, loss_fn
 
         return run, q
 
-    run, q = _cached(("contrastive", id(build), loss_fn, logsumexp_coeff, lr), build, make)
+    run, q = _cached(("contrastive", id(build), loss_fn, logsumexp_coeff, lr), build, make,
+                     stacked, (0, 0))
     params, losses, accs = run(key, jax.device_put(batches))
     return params, q, losses.tolist(), accs.tolist()
 
 
-def train_regression(build, batches, key, lr=3e-4):
+def train_regression(build, batches, key, lr=3e-4, stacked=False):
     """Regress the architecture straight onto the optimal Q: the ceiling a given factorization
     can reach on a given dataset."""
     def make():
         init, q, _ = build(1)
         opt = optax.adam(lr)
 
-        @jax.jit
         def run(key, batches):
             params = init(key)
             opt_state = opt.init(params)
@@ -165,7 +170,7 @@ def train_regression(build, batches, key, lr=3e-4):
 
         return run, q
 
-    run, q = _cached(("regression", id(build), lr), build, make)
+    run, q = _cached(("regression", id(build), lr), build, make, stacked, (0, 0))
     params, losses = run(key, jax.device_put(batches))
     return params, q, losses.tolist(), []
 
